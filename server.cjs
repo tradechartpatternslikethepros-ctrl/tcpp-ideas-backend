@@ -1,8 +1,8 @@
 /* server.cjs
  * TCPP Ideas Backend (Express) + Email + Subscribers
- * Storage: JSON files on disk (/data)
- * Auth: All writes & /email/* require API_TOKEN via Bearer header OR ?token=
- * SSE events: idea:new, idea:update, idea:delete, comments:update, likes:update
+ * - Storage: JSON files on disk (/data)
+ * - Auth: All writes & /email/* require API_TOKEN via Bearer header OR ?token=
+ * - SSE events: idea:new, idea:update, idea:delete, comments:update, likes:update
  */
 
 'use strict';
@@ -44,13 +44,13 @@ const SMTP_USER   = process.env.SMTP_USER   || '';
 const SMTP_PASS   = process.env.SMTP_PASS   || '';
 
 /* From / Reply / Admin controls */
-const MAIL_FROM         = process.env.MAIL_FROM || '';
+const MAIL_FROM         = process.env.MAIL_FROM || '';                    // e.g. "noreply@domain.com"
 const MAIL_FROM_NAME    = process.env.MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
-const EMAIL_FROM_INLINE = process.env.EMAIL_FROM || '';
+const EMAIL_FROM_INLINE = process.env.EMAIL_FROM || '';                   // e.g. "Brand <noreply@domain.com>"
 const EMAIL_REPLY_TO    = (process.env.EMAIL_REPLY_TO || '').trim();
 const EMAIL_BCC_ADMIN   = (process.env.EMAIL_BCC_ADMIN || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-const EMAIL_FORCE_ALL_TO = (process.env.EMAIL_FORCE_ALL_TO || '').trim().toLowerCase();
+const EMAIL_FORCE_ALL_TO = (process.env.EMAIL_FORCE_ALL_TO || '').trim().toLowerCase(); // for staging/tests
 
 /* Branding */
 const SITE_NAME   = process.env.SITE_NAME   || 'Trade Chart Patterns — Pro';
@@ -59,24 +59,11 @@ const LOGO_URL    = process.env.EMAIL_LOGO_URL
   || process.env.LOGO_URL
   || 'https://static.wixstatic.com/media/e09166_90ddc4c3b20d4b4b83461681f85d9dd8~mv2.png';
 
-/* Theme + asset base (absolute URLs for images in emails) */
-const ASSET_BASE_URL = process.env.ASSET_BASE_URL || SITE_URL;   // e.g. https://api.yourdomain.com
-const EMAIL_THEME    = (process.env.EMAIL_THEME || 'dark').toLowerCase(); // 'dark' | 'clear'
-
 /* ---------------------- UTIL ---------------------- */
 const nowISO = () => new Date().toISOString();
 async function ensureDir(p) { await fsp.mkdir(p, { recursive: true }).catch(() => {}); }
 function ok(res, data) { res.json(data); }
 function err(res, code, msg) { res.status(code).json({ status:'error', code, message: msg || 'Error' }); }
-
-/* Make absolute HTTPS URLs for email clients */
-function absUrl(u) {
-  const s = String(u || '').trim();
-  if (!s) return '';
-  if (/^https?:\/\//i.test(s)) return s;
-  const base = (ASSET_BASE_URL || SITE_URL || '').replace(/\/+$/,'');
-  return base + (s.startsWith('/') ? s : `/${s}`);
-}
 
 /* -------------------- STORAGE -------------------- */
 const blankDB   = () => ({ ideas: [] });
@@ -143,7 +130,7 @@ function readQueryToken(req) {
   return (req.query && String(req.query.token || '').trim()) || '';
 }
 function requireAuth(req, res, next) {
-  if (!API_TOKEN) return next();
+  if (!API_TOKEN) return next(); // allowed, but set API_TOKEN in production
   const tok = readBearer(req) || readQueryToken(req);
   if (tok !== API_TOKEN) return err(res, 401, 'Unauthorized');
   next();
@@ -156,9 +143,12 @@ function sseAuthOK(req) {
 
 /* ----------------------- SSE ---------------------- */
 const clients = new Set(); // { id, res, ping }
+
 function sseSend(event, data) {
   const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const c of clients) { try { c.res.write(line); } catch {} }
+  for (const c of clients) {
+    try { c.res.write(line); } catch { /* ignore */ }
+  }
 }
 function sseSendTo(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -171,20 +161,29 @@ const app = express();
 function isOriginAllowed(origin) {
   if (!origin) return true;
   if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return true;
+
   try {
     const { protocol, host } = new URL(origin);
+    // Allow Wix + filesusr wildcards explicitly
     if (host.endsWith('.wixsite.com')) return protocol === 'https:';
     if (host.endsWith('.filesusr.com')) return protocol === 'https:';
+
+    // Support entries like "https://*.example.com"
     for (const pat of CORS_ORIGINS) {
       if (!pat.includes('*')) continue;
       const m = pat.match(/^https?:\/\/\*\.(.+)$/i);
       if (m && host.endsWith(m[1])) return protocol === 'https:';
     }
+
+    // Local dev convenience
     if (/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host)) return true;
-  } catch {}
+  } catch { /* fall through */ }
   return false;
 }
-app.use(cors({ origin: (origin, cb) => cb(null, isOriginAllowed(origin)), credentials: false }));
+app.use(cors({
+  origin: (origin, cb) => cb(null, isOriginAllowed(origin)),
+  credentials: false
+}));
 
 /* JSON body */
 app.use(express.json({ limit: '1mb' }));
@@ -202,6 +201,7 @@ app.get('/health', (_req, res) => ok(res, { ok: true, env: NODE_ENV, time: nowIS
 /* ---------------------- EVENTS (SSE) ------------- */
 app.get('/events', (req, res) => {
   if (!sseAuthOK(req)) return err(res, 401, 'Unauthorized');
+
   res.set({
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
@@ -209,12 +209,21 @@ app.get('/events', (req, res) => {
     'X-Accel-Buffering': 'no'
   });
   res.flushHeaders?.();
+
   const id = nanoid(10);
   const client = { id, res, ping: null };
   clients.add(client);
+
+  // greet + keepalive pings
   sseSendTo(res, 'hello', { id, at: nowISO() });
-  client.ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
-  req.on('close', () => { clearInterval(client.ping); clients.delete(client); });
+  client.ping = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch { /* ignore */ }
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(client.ping);
+    clients.delete(client);
+  });
 });
 
 /* -------------------- NORMALIZATION -------------- */
@@ -270,7 +279,7 @@ app.get('/ideas/latest', async (req, res) => {
     .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, limit)
     .map(ideaPublic);
-  ok(res, { items, ideas: items });
+  ok(res, { items, ideas: items }); // compat
 });
 
 app.get('/ideas/:id', async (req, res) => {
@@ -278,7 +287,7 @@ app.get('/ideas/:id', async (req, res) => {
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
   const pub = ideaPublic(it);
-  ok(res, { item: pub, idea: pub });
+  ok(res, { item: pub, idea: pub }); // compat
 });
 
 app.post('/ideas', requireAuth, async (req, res) => {
@@ -288,13 +297,14 @@ app.post('/ideas', requireAuth, async (req, res) => {
   await saveDB(db);
   const pub = ideaPublic(it);
   sseSend('idea:new', pub);
-  ok(res, { item: pub, idea: pub });
+  ok(res, { item: pub, idea: pub }); // compat
 });
 
 app.patch('/ideas/:id', requireAuth, async (req, res) => {
   const db = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
   if (idx < 0) return err(res, 404, 'Not found');
+
   const it = db.ideas[idx];
   Object.assign(it, {
     type:      req.body.type      ?? it.type,
@@ -308,10 +318,11 @@ app.patch('/ideas/:id', requireAuth, async (req, res) => {
     media: Array.isArray(req.body.media) ? req.body.media : it.media,
     updatedAt: nowISO()
   });
+
   await saveDB(db);
   const pub = ideaPublic(it);
   sseSend('idea:update', pub);
-  ok(res, { item: pub, idea: pub });
+  ok(res, { item: pub, idea: pub }); // compat
 });
 
 app.delete('/ideas/:id', requireAuth, async (req, res) => {
@@ -326,18 +337,23 @@ app.delete('/ideas/:id', requireAuth, async (req, res) => {
 });
 
 /* ---------------------- LIKES --------------------- */
+// Primary route
 async function likeHandler(req, res) {
   const action      = String(req.body?.action || req.body?.op || '').toLowerCase();
   const userId      = String(req.body?.userId || req.body?.by || '').slice(0, 120);
   const displayName = String(req.body?.displayName || req.body?.name || 'Member').slice(0, 120);
+
   if (!['like', 'unlike'].includes(action)) return err(res, 400, 'Invalid action');
   if (!userId) return err(res, 400, 'userId required');
+
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
+
   it.likes ||= { count: 0, by: {} };
   it.likes.by ||= {};
   const was = !!it.likes.by[userId];
+
   if (action === 'like' && !was) {
     it.likes.by[userId] = { at: nowISO(), name: displayName };
     it.likes.count = Math.max(0, Number(it.likes.count || 0)) + 1;
@@ -346,11 +362,13 @@ async function likeHandler(req, res) {
     delete it.likes.by[userId];
     it.likes.count = Math.max(0, Number(it.likes.count || 1) - 1);
   }
+
   await saveDB(db);
   sseSend('likes:update', { id: it.id, likeCount: it.likes.count });
   ok(res, { likeCount: it.likes.count, likes: { count: it.likes.count } });
 }
 app.put('/ideas/:id/likes', requireAuth, likeHandler);
+// Friendly aliases to match various clients
 app.post('/ideas/:id/likes', requireAuth, likeHandler);
 app.put('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 app.post('/ideas/:id/likes/toggle', requireAuth, likeHandler);
@@ -360,14 +378,17 @@ async function _commentAdd(req, res) {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
+
   const text       = String(req.body?.text || '').trim();
   const authorId   = String(req.body?.authorId || '').slice(0, 120);
   const authorName = String(req.body?.authorName || 'Member').slice(0, 120);
   if (!text) return err(res, 400, 'text required');
+
   const c = { id: nanoid(10), authorId, authorName, text, createdAt: nowISO(), updatedAt: nowISO() };
   it.comments ||= { items: [] };
   it.comments.items.push(c);
   await saveDB(db);
+
   const items = it.comments.items.map(x => ({
     id: x.id, authorName: x.authorName, text: x.text, createdAt: x.createdAt, updatedAt: x.updatedAt
   }));
@@ -378,13 +399,17 @@ async function _commentEdit(req, res) {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
+
   const c = (it.comments?.items || []).find(x => String(x.id) === String(req.params.cid));
   if (!c) return err(res, 404, 'comment not found');
+
   const text = String(req.body?.text || '').trim();
   if (!text) return err(res, 400, 'text required');
+
   c.text = text;
   c.updatedAt = nowISO();
   await saveDB(db);
+
   const items = it.comments.items.map(x => ({
     id: x.id, authorName: x.authorName, text: x.text, createdAt: x.createdAt, updatedAt: x.updatedAt
   }));
@@ -395,10 +420,12 @@ async function _commentDelete(req, res) {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
+
   const before = (it.comments?.items || []).length;
   it.comments.items = (it.comments?.items || []).filter(x => String(x.id) !== String(req.params.cid));
   const after = it.comments.items.length;
   if (before === after) return err(res, 404, 'comment not found');
+
   await saveDB(db);
   const items = it.comments.items.map(x => ({
     id: x.id, authorName: x.authorName, text: x.text, createdAt: x.createdAt, updatedAt: x.updatedAt
@@ -406,6 +433,7 @@ async function _commentDelete(req, res) {
   sseSend('comments:update', { id: it.id, items });
   ok(res, { items });
 }
+
 app.post('/ideas/:id/comments', requireAuth, _commentAdd);
 app.patch('/ideas/:id/comments/:cid', requireAuth, _commentEdit);
 app.put  ('/ideas/:id/comments/:cid', requireAuth, _commentEdit);
@@ -416,6 +444,7 @@ app.get('/subscribers', requireAuth, async (_req, res) => {
   const s = await loadSubs();
   ok(res, { count: s.subs.length, items: s.subs });
 });
+
 async function subscribeCore(email, name) {
   const s = await loadSubs();
   const exists = (s.subs || []).find(x => x.email === email);
@@ -429,6 +458,7 @@ async function unsubscribeCore(email) {
   await saveSubs(s);
   return { ok: true };
 }
+
 app.post('/subscribe', requireAuth, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const name  = String(req.body?.name || 'Member').trim();
@@ -436,6 +466,8 @@ app.post('/subscribe', requireAuth, async (req, res) => {
   const out = await subscribeCore(email, name);
   ok(res, out);
 });
+
+// Friendly aliases to match clients that probe multiple endpoints
 app.post('/api/subscribe', requireAuth, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const name  = String(req.body?.name || 'Member').trim();
@@ -450,6 +482,7 @@ app.post('/email/subscribe', requireAuth, async (req, res) => {
   const out = await subscribeCore(email, name);
   ok(res, out);
 });
+
 app.post('/unsubscribe', requireAuth, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   if (!email) return err(res, 400, 'email required');
@@ -469,7 +502,7 @@ app.post('/email/unsubscribe', requireAuth, async (req, res) => {
   ok(res, out);
 });
 
-/* --------------------- EMAIL CORE ----------------- */
+/* --------------------- EMAIL (SMTP + HTTP fallback) --------------------- */
 function smtpReady() {
   return !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true));
 }
@@ -480,7 +513,7 @@ function getTransporter() {
   transporter = nodemailer.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT,
-    secure: SMTP_SECURE,
+    secure: SMTP_SECURE,               // true => 465 SSL; false => 587 STARTTLS
     auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
     connectionTimeout: 10000,
     greetingTimeout: 10000,
@@ -488,8 +521,10 @@ function getTransporter() {
   });
   return transporter;
 }
+
+/* Construct "from" */
 function fromHeader() {
-  if (EMAIL_FROM_INLINE) return EMAIL_FROM_INLINE;
+  if (EMAIL_FROM_INLINE) return EMAIL_FROM_INLINE; // "Brand <noreply@…>"
   if (MAIL_FROM) return `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`;
   if (SMTP_USER) return `"${MAIL_FROM_NAME}" <${SMTP_USER}>`;
   return `"${MAIL_FROM_NAME}" <no-reply@localhost>`;
@@ -510,228 +545,45 @@ function packToBcc(all) {
   return { to: uniqd[0], bcc: uniqd.slice(1) };
 }
 
-/* ===================== EMAIL TEMPLATE (THEMED) ===================== */
-function _esc(s) {
-  return String(s || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-function _bullets(s) {
-  const parts = String(s || '')
-    .split(/\r?\n|[;•]\s*/g)
-    .map(x => x.trim())
-    .filter(Boolean);
-  if (!parts.length) return '';
-  return `<ul style="margin:8px 0 0 20px;padding:0">
-    ${parts.map(li => `<li style="margin:6px 0;line-height:1.45">${_esc(li)}</li>`).join('')}
-  </ul>`;
-}
-function _firstImage(item) {
-  const raw = item?.imageUrl ||
-    (Array.isArray(item?.media) && item.media[0] && item.media[0].url) || '';
-  return absUrl(raw);
-}
-function ideaDeepLink(item) {
-  const base = `${SITE_URL}/trading-dashboard`;
-  const id   = String(item?.id || '').trim();
-  if (!id) return base;
-  const q    = `?idea=${encodeURIComponent(id)}&utm_source=email&utm_medium=notification&utm_campaign=${encodeURIComponent(item?.symbol ? 'idea-'+item.symbol : 'idea')}`;
-  return `${base}${q}`;
-}
-function _emailShell({ preheader, title, symbol, levelsHTML, planHTML, imgUrl, ctaHref, ctaText, badgeText, theme }) {
-  const t = (theme || EMAIL_THEME);
-  const isClear = ['clear','transparent','none','minimal'].includes(t);
-
-  const logo = absUrl(LOGO_URL);
-  const brand = MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
-  const hasImg = !!imgUrl;
-
-  const bodyBg     = isClear ? '' : 'background:#0a0f1a;';
-  const container  = isClear
-    ? 'background:transparent;border:none;box-shadow:none;'
-    : 'background:#0b1220;border:1px solid rgba(255,255,255,0.06);box-shadow:0 6px 28px rgba(0,0,0,0.35);';
-  const headGrad   = isClear ? '' : 'background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0));';
-  const textColor  = isClear ? '#0b1220' : '#e8eefc';
-  const titleColor = isClear ? '#0b1220' : '#f5f8ff';
-  const badgeBg    = isClear ? 'rgba(0,0,0,0.05)' : 'rgba(255,255,255,0.06)';
-  const badgeColor = isClear ? '#0b1220' : '#dce6ff';
-  const pillBg     = isClear ? 'rgba(0,208,255,0.10)' : '#0fd5ff12';
-  const pillBor    = isClear ? '1px solid rgba(0,208,255,0.35)' : '1px solid #0fd5ff38';
-  const pillColor  = isClear ? '#005a6a' : '#9be8ff';
-  const secBg      = isClear ? 'rgba(0,0,0,0.03)' : 'rgba(255,255,255,0.03)';
-  const secBor     = isClear ? '1px dashed rgba(0,0,0,0.08)' : '1px dashed rgba(255,255,255,0.08)';
-  const footerBor  = isClear ? '1px solid rgba(0,0,0,0.06)' : '1px solid rgba(255,255,255,0.06)';
-  const footerTxt  = isClear ? '#3a4358' : '#8fa0c6';
-  const visitColor = isClear ? '#164a76' : '#cfe8ff';
-  const visitBor   = isClear ? '1px solid rgba(0,0,0,0.12)' : '1px solid rgba(255,255,255,0.14)';
-
-  return `<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="x-apple-disable-message-reformatting">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>${_esc(title)}</title>
-  </head>
-  <body style="margin:0;padding:0;${bodyBg}">
-    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent">
-      ${_esc(preheader || title)}
-    </div>
-
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="${isClear ? '' : 'background:#0a0f1a;'}padding:24px 14px">
-      <tr>
-        <td align="center">
-
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:680px;${container}border-radius:18px;overflow:hidden">
-            <tr>
-              <td align="center" style="padding:22px 20px 8px 20px;${headGrad}">
-                <a href="${_esc(SITE_URL)}" style="text-decoration:none;display:inline-block" target="_blank" rel="noopener">
-                  <img src="${_esc(logo)}" alt="${_esc(brand)}" width="220" style="display:block;width:220px;max-width:220px;height:auto;">
-                </a>
-                ${badgeText ? `
-                <div style="margin:14px auto 0 auto;display:inline-block;padding:6px 12px;border-radius:999px;
-                            background:${badgeBg};color:${badgeColor};font-weight:700;font-size:12px;letter-spacing:.35px;
-                            text-transform:uppercase;">
-                  ${_esc(badgeText)}
-                </div>` : ''}
-              </td>
-            </tr>
-
-            ${hasImg ? `
-            <tr>
-              <td style="padding:8px 20px 0 20px">
-                <img src="${_esc(imgUrl)}" alt="Chart" width="640"
-                     style="display:block;width:100%;max-width:640px;height:auto;border-radius:14px;
-                            border:1px solid ${isClear ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.08)'};">
-              </td>
-            </tr>` : ''}
-
-            <tr>
-              <td style="padding:18px 20px 8px 20px;color:${textColor};font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;">
-                ${symbol ? `
-                  <div style="margin:2px 0 10px 0">
-                    <span style="display:inline-block;background:${pillBg};color:${pillColor};border:${pillBor};
-                                padding:6px 10px;border-radius:999px;font-weight:700;font-size:12px;letter-spacing:.2px;">
-                      ${_esc(symbol)}
-                    </span>
-                  </div>` : ''}
-
-                <h1 style="margin:0 0 8px 0;font-size:22px;line-height:1.3;color:${titleColor};font-weight:800;">
-                  ${_esc(title)}
-                </h1>
-
-                ${levelsHTML ? `
-                  <div style="margin:12px 0 10px 0;padding:12px 14px;border-radius:12px;background:${secBg};
-                              border:${secBor};">
-                    <div style="font-size:12px;color:${isClear ? '#5a6a8a' : '#99a6c7'};letter-spacing:.3px;text-transform:uppercase;font-weight:700;margin-bottom:6px">
-                      Levels
-                    </div>
-                    ${levelsHTML}
-                  </div>` : ''}
-
-                ${planHTML ? `
-                  <div style="margin:12px 0 0 0;">
-                    <div style="font-size:12px;color:${isClear ? '#5a6a8a' : '#99a6c7'};letter-spacing:.3px;text-transform:uppercase;font-weight:700;margin-bottom:6px">
-                      Plan
-                    </div>
-                    ${planHTML}
-                  </div>` : ''}
-              </td>
-            </tr>
-
-            <tr>
-              <td align="left" style="padding:8px 20px 24px 20px">
-                <table role="presentation" cellpadding="0" cellspacing="0">
-                  <tr>
-                    <td>
-                      <a href="${_esc(ctaHref)}"
-                         style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;
-                                text-decoration:none;border-radius:999px;font-weight:900;font-size:14px"
-                         target="_blank" rel="noopener">
-                        ${_esc(ctaText || 'Open on Dashboard')}
-                      </a>
-                    </td>
-                    <td width="12"></td>
-                    <td>
-                      <a href="${_esc(SITE_URL)}"
-                         style="display:inline-block;padding:12px 16px;background:transparent;color:${visitColor};
-                                text-decoration:none;border-radius:999px;font-weight:700;font-size:14px;
-                                border:${visitBor}"
-                         target="_blank" rel="noopener">
-                        Visit Site
-                      </a>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
-
-            <tr>
-              <td style="padding:14px 20px 20px 20px;color:${footerTxt};font-size:12px;border-top:${footerBor};">
-                <div style="opacity:.9">
-                  You’re receiving this update from ${_esc(brand)}.
-                </div>
-                <div style="opacity:.6;margin-top:6px">
-                  This notification links to your dashboard and will <em>auto-scroll</em> to the idea.
-                </div>
-              </td>
-            </tr>
-
-          </table>
-        </td>
-      </tr>
-    </table>
-  </body>
-</html>`;
-}
-
 function emailTemplatePost(item) {
-  const title   = item?.title || 'New Idea';
-  const symbol  = item?.symbol || '';
-  const levels  = _bullets(item?.levelText || item?.levels || '');
-  const plan    = _bullets(item?.take || item?.content || '');
-  const imgUrl  = _firstImage(item);
-  const deepURL = ideaDeepLink(item);
-  const pre     = `${symbol ? symbol + ' • ' : ''}${title}`;
-  return _emailShell({
-    preheader: `New Idea — ${pre}`,
-    title,
-    symbol,
-    levelsHTML: levels,
-    planHTML: plan,
-    imgUrl,
-    ctaHref: deepURL,
-    ctaText: 'Open on Dashboard',
-    badgeText: '🔔 New Idea',
-    theme: EMAIL_THEME
-  });
+  const title  = item.title || 'New idea';
+  const symbol = item.symbol || '';
+  const levels = item.levelText || '';
+  const take   = item.take || '';
+  const link   = item.link || '';
+  const imgUrl = item.imageUrl || (Array.isArray(item.media) && item.media[0] && item.media[0].url) || '';
+  const viewUrl = link || `${SITE_URL}`;
+  return `
+  <div style="font-family:Inter,Arial,Helvetica,sans-serif;max-width:660px;margin:0 auto;color:#0b1220">
+    <div style="padding:18px 0;text-align:center">
+      <img src="${LOGO_URL}" alt="${SITE_NAME}" style="height:42px"/>
+    </div>
+    <div style="background:#0b1220;color:#e9eefb;border-radius:14px;padding:18px;border:1px solid rgba(255,255,255,.08)">
+      <div style="font-size:14px;opacity:.8;margin-bottom:8px">${SITE_NAME}</div>
+      <h2 style="margin:0 0 8px 0">${title}</h2>
+      ${symbol ? `<div style="margin:4px 0 12px 0;font-weight:700">${symbol}</div>` : ''}
+      ${levels ? `<div style="margin:8px 0 12px 0"><strong>Levels:</strong><br>${levels.replace(/;/g,'; ')}</div>`:''}
+      ${take   ? `<div style="margin:8px 0 12px 0"><strong>Plan:</strong><br>${take}</div>`:''}
+      ${imgUrl ? `<div style="margin:10px 0"><img src="${imgUrl}" alt="Chart" style="max-width:100%;border-radius:10px;border:1px solid rgba(255,255,255,.12)"/></div>`:''}
+      <a href="${viewUrl}" style="display:inline-block;margin-top:4px;padding:10px 14px;background:#00d0ff;color:#001018;text-decoration:none;border-radius:999px;font-weight:800">Open idea</a>
+    </div>
+    <div style="text-align:center;font-size:12px;color:#445;opacity:.8;margin-top:12px">
+      You’re receiving this update from ${SITE_NAME}.
+    </div>
+  </div>`;
 }
-
 function emailTemplateSignal(item) {
-  const title   = item?.title || 'New Signal';
-  const symbol  = item?.symbol || '';
-  const levels  = _bullets(item?.levelText || '');
-  const plan    = _bullets(item?.take || '');
-  const imgUrl  = _firstImage(item);
-  const deepURL = ideaDeepLink(item);
-  const pre     = `${symbol ? symbol + ' • ' : ''}${title}`;
-  return _emailShell({
-    preheader: `Signal — ${pre}`,
-    title,
-    symbol,
-    levelsHTML: levels,
-    planHTML: plan,
-    imgUrl,
-    ctaHref: deepURL,
-    ctaText: 'View Signal',
-    badgeText: '⚡️ Signal',
-    theme: EMAIL_THEME
-  });
+  const title = item.title || 'New signal';
+  const base  = emailTemplatePost(item);
+  return base.replace('New idea:', 'Signal:').replace('New idea', title);
 }
 
-/* Recipient resolution with admin fallback */
+/* Recipient resolution:
+ * 1) If EMAIL_FORCE_ALL_TO set → send only there (great for testing)
+ * 2) Else if subscribers exist → send to subscribers
+ * 3) Else if actor.email exists in request → send to actor
+ * Always BCC admin(s) if configured
+ */
 async function resolveRecipients(reqBody) {
   const forced = splitEmails(EMAIL_FORCE_ALL_TO);
   if (forced.length) return { list: forced, note: 'forced' };
@@ -740,33 +592,43 @@ async function resolveRecipients(reqBody) {
   const subList = uniq((subs?.subs || [])
     .map(s => String(s.email || '').toLowerCase())
     .filter(e => EMAIL_RX.test(e)));
+
   if (subList.length) return { list: subList, note: 'subscribers' };
 
-  const actorEmail = String(reqBody?.actor?.email || reqBody?.actorEmail || '').trim().toLowerCase();
+  const actorEmail = String(reqBody?.actor?.email || '').trim().toLowerCase();
   if (EMAIL_RX.test(actorEmail)) return { list: [actorEmail], note: 'actor' };
-
-  const admins = (EMAIL_BCC_ADMIN || []).filter(e => EMAIL_RX.test(e));
-  if (admins.length) return { list: admins, note: 'admin-fallback' };
 
   return { list: [], note: 'none' };
 }
 
 /* SMTP first, then Mailjet HTTP fallback (v3.1) */
 async function sendEmailBlast({ subject, html, toList }) {
+  // Try SMTP first
   try{
     const tx = getTransporter();
     if (tx && toList.length){
       const from    = fromHeader();
       const replyTo = EMAIL_REPLY_TO || undefined;
       const adminBcc = EMAIL_BCC_ADMIN;
+
       const { to, bcc } = packToBcc(toList);
       const finalBcc = uniq([...(bcc || []), ...adminBcc]);
-      const info = await tx.sendMail({ from, to: to || undefined, bcc: finalBcc.length ? finalBcc : undefined, subject, html, replyTo });
+
+      const info = await tx.sendMail({
+        from,
+        to: to || undefined,
+        bcc: finalBcc.length ? finalBcc : undefined,
+        subject,
+        html,
+        replyTo
+      });
       return { sent: toList.length, messageId: info?.messageId || '', via:'smtp' };
     }
   }catch(e){
     console.warn('[email][smtp] failed, trying HTTP fallback:', e?.message || e);
   }
+
+  // HTTP fallback via Mailjet (SMTP_USER/PASS are Mailjet API key/secret)
   if (!(SMTP_USER && SMTP_PASS)) throw new Error('No SMTP creds for HTTP fallback');
   if (!toList.length) return { sent:0, via:'http' };
 
@@ -779,6 +641,7 @@ async function sendEmailBlast({ subject, html, toList }) {
       Headers: EMAIL_REPLY_TO ? { 'Reply-To': EMAIL_REPLY_TO } : undefined
     }]
   };
+
   const auth = Buffer.from(`${SMTP_USER}:${SMTP_PASS}`).toString('base64');
   const body = JSON.stringify(payload);
 
@@ -805,6 +668,7 @@ async function sendEmailBlast({ subject, html, toList }) {
     req.write(body);
     req.end();
   });
+
   return { sent: toList.length, via: 'http', raw: httpResult.status };
 }
 
@@ -814,13 +678,12 @@ app.post('/email/post', requireAuth, async (req, res) => {
     const item = req.body?.item || req.body?.data || null;
     if (!item) return err(res, 400, 'item required');
 
-    console.log('[email][post] imgUrl=', _firstImage(item));
     const { list, note } = await resolveRecipients(req.body || {});
-    console.log('[email][post] recipients:', note, list.length, list.slice(0, 3));
-    if (!list.length) return ok(res, { ok:true, sent:0, info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)' });
+    if (!list.length) return ok(res, { ok:true, sent:0, info:'no recipients' });
 
-    const subject = `🔔 New Idea: ${item.symbol ? `${item.symbol} — `:''}${item.title||'Update'}`;
+    const subject = `New idea: ${item.symbol ? `${item.symbol} — `:''}${item.title||'Update'}`;
     const html = emailTemplatePost(item);
+
     const result = await sendEmailBlast({ subject, html, toList:list });
     ok(res, { ok:true, sent: result.sent, mode: note, via: result.via });
   }catch(e){ err(res, 500, e.message || 'Email failed'); }
@@ -831,72 +694,15 @@ app.post('/email/signal', requireAuth, async (req, res) => {
     const item = req.body?.item || req.body?.data || null;
     if (!item) return err(res, 400, 'item required');
 
-    console.log('[email][signal] imgUrl=', _firstImage(item));
     const { list, note } = await resolveRecipients(req.body || {});
-    console.log('[email][signal] recipients:', note, list.length, list.slice(0, 3));
-    if (!list.length) return ok(res, { ok:true, sent:0, info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)' });
+    if (!list.length) return ok(res, { ok:true, sent:0, info:'no recipients' });
 
-    const subject = `⚡️ Signal: ${item.symbol ? `${item.symbol} — `:''}${item.title||'Update'}`;
+    const subject = `Signal: ${item.symbol ? `${item.symbol} — `:''}${item.title||'Update'}`;
     const html = emailTemplateSignal(item);
+
     const result = await sendEmailBlast({ subject, html, toList:list });
     ok(res, { ok:true, sent: result.sent, mode: note, via: result.via });
   }catch(e){ err(res, 500, e.message || 'Email failed'); }
-});
-
-/* ---------------------- DEBUG EMAIL -------------- */
-app.get('/debug/email/status', requireAuth, (req, res) => {
-  ok(res, {
-    smtp: {
-      ready: !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true)),
-      host: SMTP_HOST || null,
-      port: SMTP_PORT || null,
-      secure: SMTP_SECURE,
-      hasUser: !!SMTP_USER,
-      hasPass: !!SMTP_PASS,
-    },
-    branding: {
-      siteUrl: SITE_URL,
-      logo: LOGO_URL,
-      from: fromHeader(),
-      bccAdmins: EMAIL_BCC_ADMIN,
-      forceTo: EMAIL_FORCE_ALL_TO || null,
-      assetBaseUrl: ASSET_BASE_URL,
-      emailTheme: EMAIL_THEME
-    }
-  });
-});
-
-app.post('/debug/email/test', requireAuth, async (req, res) => {
-  try {
-    const rawTo = req.query.to || req.body?.to || EMAIL_FORCE_ALL_TO || (EMAIL_BCC_ADMIN || []).join(',');
-    const toList = splitEmails(rawTo);
-    if (!toList.length) return err(res, 400, 'provide ?to= or set EMAIL_FORCE_ALL_TO or EMAIL_BCC_ADMIN');
-
-    const imgParam = req.query.img || req.body?.img || '';
-    const imgUrl   = absUrl(imgParam);
-
-    const html = _emailShell({
-      preheader: 'Test notification from Ideas Backend',
-      title: `Test Email — ${EMAIL_THEME === 'clear' ? 'Transparent' : 'Dark'} Theme`,
-      symbol: 'OANDA:TEST',
-      levelsHTML: _bullets('PRZ 2345–2351; T1 2321; SL 2359'),
-      planHTML: _bullets('Short on rejection; Risk ≤1%'),
-      imgUrl,
-      ctaHref: `${SITE_URL}/trading-dashboard`,
-      ctaText: 'Open Dashboard',
-      badgeText: 'Test',
-      theme: EMAIL_THEME
-    });
-
-    const result = await sendEmailBlast({
-      subject: 'Test — Ideas Backend Email',
-      html,
-      toList
-    });
-    ok(res, { ok:true, sent: result.sent, via: result.via, img: imgUrl });
-  } catch (e) {
-    err(res, 500, e.message || 'Test email failed');
-  }
 });
 
 /* ----------------------- UPLOAD ------------------- */
@@ -915,10 +721,10 @@ async function start() {
   await ensureDir(DATA_DIR);
   await ensureDir(UPLOAD_DIR);
   buildMulter();
+
   app.listen(PORT, () => {
     console.log(`[tcpp-ideas-backend] listening on :${PORT} env=${NODE_ENV} data=${DATA_FILE}`);
-    console.log(`SSE: /events  CRUD: /ideas  Latest: /ideas/latest  Upload: /upload  Subs: /subscribe`);
-    console.log(`Email: /email/post, /email/signal  Debug: /debug/email/status, /debug/email/test`);
+    console.log(`SSE: /events  CRUD: /ideas  Latest: /ideas/latest  Upload: /upload  Subs: /subscribe  Email: /email/post,/email/signal`);
   });
 }
 start();
