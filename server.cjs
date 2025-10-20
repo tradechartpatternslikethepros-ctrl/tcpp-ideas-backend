@@ -337,7 +337,8 @@ app.delete('/ideas/:id', requireAuth, async (req, res) => {
 });
 
 /* ---------------------- LIKES --------------------- */
-app.put('/ideas/:id/likes', requireAuth, async (req, res) => {
+// Primary route
+async function likeHandler(req, res) {
   const action      = String(req.body?.action || req.body?.op || '').toLowerCase();
   const userId      = String(req.body?.userId || req.body?.by || '').slice(0, 120);
   const displayName = String(req.body?.displayName || req.body?.name || 'Member').slice(0, 120);
@@ -365,7 +366,12 @@ app.put('/ideas/:id/likes', requireAuth, async (req, res) => {
   await saveDB(db);
   sseSend('likes:update', { id: it.id, likeCount: it.likes.count });
   ok(res, { likeCount: it.likes.count, likes: { count: it.likes.count } });
-});
+}
+app.put('/ideas/:id/likes', requireAuth, likeHandler);
+// Friendly aliases to match various clients
+app.post('/ideas/:id/likes', requireAuth, likeHandler);
+app.put('/ideas/:id/likes/toggle', requireAuth, likeHandler);
+app.post('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 
 /* -------------------- COMMENTS -------------------- */
 async function _commentAdd(req, res) {
@@ -439,24 +445,61 @@ app.get('/subscribers', requireAuth, async (_req, res) => {
   ok(res, { count: s.subs.length, items: s.subs });
 });
 
-app.post('/subscribe', requireAuth, async (req, res) => {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  const name  = String(req.body?.name || 'Member').trim();
-  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return err(res, 400, 'Valid email required');
-
+async function subscribeCore(email, name) {
   const s = await loadSubs();
   const exists = (s.subs || []).find(x => x.email === email);
   if (!exists) (s.subs ||= []).push({ email, name, createdAt: nowISO(), status: 'active' });
   await saveSubs(s);
-  ok(res, { ok: true });
+  return { ok: true };
+}
+async function unsubscribeCore(email) {
+  const s = await loadSubs();
+  s.subs = (s.subs || []).filter(x => x.email !== email);
+  await saveSubs(s);
+  return { ok: true };
+}
+
+app.post('/subscribe', requireAuth, async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const name  = String(req.body?.name || 'Member').trim();
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return err(res, 400, 'Valid email required');
+  const out = await subscribeCore(email, name);
+  ok(res, out);
+});
+
+// Friendly aliases to match clients that probe multiple endpoints
+app.post('/api/subscribe', requireAuth, async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const name  = String(req.body?.name || 'Member').trim();
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return err(res, 400, 'Valid email required');
+  const out = await subscribeCore(email, name);
+  ok(res, out);
+});
+app.post('/email/subscribe', requireAuth, async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const name  = String(req.body?.name || 'Member').trim();
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return err(res, 400, 'Valid email required');
+  const out = await subscribeCore(email, name);
+  ok(res, out);
 });
 
 app.post('/unsubscribe', requireAuth, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
-  const s = await loadSubs();
-  s.subs = (s.subs || []).filter(x => x.email !== email);
-  await saveSubs(s);
-  ok(res, { ok: true });
+  if (!email) return err(res, 400, 'email required');
+  const out = await unsubscribeCore(email);
+  ok(res, out);
+});
+app.post('/api/unsubscribe', requireAuth, async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!email) return err(res, 400, 'email required');
+  const out = await unsubscribeCore(email);
+  ok(res, out);
+});
+app.post('/email/unsubscribe', requireAuth, async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  if (!email) return err(res, 400, 'email required');
+  const out = await unsubscribeCore(email);
+  ok(res, out);
 });
 
 /* --------------------- EMAIL (SMTP + HTTP fallback) --------------------- */
@@ -560,7 +603,7 @@ async function resolveRecipients(reqBody) {
 
 /* SMTP first, then Mailjet HTTP fallback (v3.1) */
 async function sendEmailBlast({ subject, html, toList }) {
-  // Try SMTP
+  // Try SMTP first
   try{
     const tx = getTransporter();
     if (tx && toList.length){
