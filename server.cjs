@@ -1,7 +1,7 @@
-/* server/server.cjs
+/* server.cjs
  * TCPP Ideas Backend (Express) + Email + Subscribers
  * - Storage: JSON files on disk (/data)
- * - Auth: All writes & /email/* require Bearer API_TOKEN. SSE accepts ?token=
+ * - Auth: All writes & /email/* require API_TOKEN via Bearer header OR ?token=
  * - SSE events: idea:new, idea:update, idea:delete, comments:update, likes:update
  */
 
@@ -14,6 +14,7 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const nodemailer = require('nodemailer');
+const https = require('https');
 const { nanoid } = require('nanoid');
 
 /* ---------------------- ENV ---------------------- */
@@ -125,15 +126,18 @@ function readBearer(req) {
   if (h && /^Bearer\s+/i.test(h)) return h.replace(/^Bearer\s+/i, '').trim();
   return '';
 }
+function readQueryToken(req) {
+  return (req.query && String(req.query.token || '').trim()) || '';
+}
 function requireAuth(req, res, next) {
   if (!API_TOKEN) return next(); // allowed, but set API_TOKEN in production
-  const tok = readBearer(req);
+  const tok = readBearer(req) || readQueryToken(req);
   if (tok !== API_TOKEN) return err(res, 401, 'Unauthorized');
   next();
 }
 function sseAuthOK(req) {
   if (!API_TOKEN) return true;
-  const tok = String(req.query.token || '');
+  const tok = readQueryToken(req);
   return tok === API_TOKEN;
 }
 
@@ -168,7 +172,7 @@ function isOriginAllowed(origin) {
     for (const pat of CORS_ORIGINS) {
       if (!pat.includes('*')) continue;
       const m = pat.match(/^https?:\/\/\*\.(.+)$/i);
-      if (m && host.endsWith(m[1])) return true;
+      if (m && host.endsWith(m[1])) return protocol === 'https:';
     }
 
     // Local dev convenience
@@ -455,7 +459,7 @@ app.post('/unsubscribe', requireAuth, async (req, res) => {
   ok(res, { ok: true });
 });
 
-/* --------------------- EMAIL ---------------------- */
+/* --------------------- EMAIL (SMTP + HTTP fallback) --------------------- */
 function smtpReady() {
   return !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true));
 }
@@ -466,8 +470,11 @@ function getTransporter() {
   transporter = nodemailer.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT,
-    secure: SMTP_SECURE,
-    auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined
+    secure: SMTP_SECURE,               // true => 465 SSL; false => 587 STARTTLS
+    auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 15000
   });
   return transporter;
 }
@@ -525,7 +532,7 @@ function emailTemplatePost(item) {
 function emailTemplateSignal(item) {
   const title = item.title || 'New signal';
   const base  = emailTemplatePost(item);
-  return base.replace('New idea:', 'Signal:');
+  return base.replace('New idea:', 'Signal:').replace('New idea', title);
 }
 
 /* Recipient resolution:
@@ -551,36 +558,80 @@ async function resolveRecipients(reqBody) {
   return { list: [], note: 'none' };
 }
 
+/* SMTP first, then Mailjet HTTP fallback (v3.1) */
 async function sendEmailBlast({ subject, html, toList }) {
-  const tx = getTransporter();
-  if (!tx) throw new Error('SMTP not configured');
+  // Try SMTP
+  try{
+    const tx = getTransporter();
+    if (tx && toList.length){
+      const from    = fromHeader();
+      const replyTo = EMAIL_REPLY_TO || undefined;
+      const adminBcc = EMAIL_BCC_ADMIN;
 
-  if (!toList.length) return { sent: 0 };
+      const { to, bcc } = packToBcc(toList);
+      const finalBcc = uniq([...(bcc || []), ...adminBcc]);
 
-  const from = fromHeader();
-  const replyTo = EMAIL_REPLY_TO || undefined;
+      const info = await tx.sendMail({
+        from,
+        to: to || undefined,
+        bcc: finalBcc.length ? finalBcc : undefined,
+        subject,
+        html,
+        replyTo
+      });
+      return { sent: toList.length, messageId: info?.messageId || '', via:'smtp' };
+    }
+  }catch(e){
+    console.warn('[email][smtp] failed, trying HTTP fallback:', e?.message || e);
+  }
 
-  const adminBcc = EMAIL_BCC_ADMIN;
-  const { to, bcc } = packToBcc(toList);
-  const finalBcc = uniq([...(bcc || []), ...adminBcc]);
+  // HTTP fallback via Mailjet (SMTP_USER/PASS are Mailjet API key/secret)
+  if (!(SMTP_USER && SMTP_PASS)) throw new Error('No SMTP creds for HTTP fallback');
+  if (!toList.length) return { sent:0, via:'http' };
 
-  const info = await tx.sendMail({
-    from,
-    to: to || undefined,
-    bcc: finalBcc.length ? finalBcc : undefined,
-    subject,
-    html,
-    replyTo
+  const payload = {
+    Messages: [{
+      From: { Email: (MAIL_FROM || SMTP_USER), Name: MAIL_FROM_NAME || 'Notifier' },
+      To: toList.map(e => ({ Email: e })),
+      Subject: subject,
+      HTMLPart: html,
+      Headers: EMAIL_REPLY_TO ? { 'Reply-To': EMAIL_REPLY_TO } : undefined
+    }]
+  };
+
+  const auth = Buffer.from(`${SMTP_USER}:${SMTP_PASS}`).toString('base64');
+  const body = JSON.stringify(payload);
+
+  const httpResult = await new Promise((resolve, reject)=>{
+    const req = https.request({
+      method: 'POST',
+      host: 'api.mailjet.com',
+      path: '/v3.1/send',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      },
+      timeout: 12000
+    }, res=>{
+      let data=''; res.on('data', c=> data+=c);
+      res.on('end', ()=>{
+        if (res.statusCode >= 200 && res.statusCode < 300) return resolve({ ok:true, status: res.statusCode, body: data });
+        return reject(new Error(`Mailjet HTTP ${res.statusCode} ${data.slice(0,200)}`));
+      });
+    });
+    req.on('timeout', ()=>{ req.destroy(new Error('Mailjet HTTP timeout')); });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
   });
 
-  return { sent: toList.length, messageId: info?.messageId || '' };
+  return { sent: toList.length, via: 'http', raw: httpResult.status };
 }
 
 /* ---------------------- EMAIL ROUTES ------------- */
 app.post('/email/post', requireAuth, async (req, res) => {
   try{
-    if (!smtpReady()) return err(res, 501, 'SMTP not configured');
-
     const item = req.body?.item || req.body?.data || null;
     if (!item) return err(res, 400, 'item required');
 
@@ -591,14 +642,12 @@ app.post('/email/post', requireAuth, async (req, res) => {
     const html = emailTemplatePost(item);
 
     const result = await sendEmailBlast({ subject, html, toList:list });
-    ok(res, { ok:true, sent: result.sent, mode: note });
+    ok(res, { ok:true, sent: result.sent, mode: note, via: result.via });
   }catch(e){ err(res, 500, e.message || 'Email failed'); }
 });
 
 app.post('/email/signal', requireAuth, async (req, res) => {
   try{
-    if (!smtpReady()) return err(res, 501, 'SMTP not configured');
-
     const item = req.body?.item || req.body?.data || null;
     if (!item) return err(res, 400, 'item required');
 
@@ -609,7 +658,7 @@ app.post('/email/signal', requireAuth, async (req, res) => {
     const html = emailTemplateSignal(item);
 
     const result = await sendEmailBlast({ subject, html, toList:list });
-    ok(res, { ok:true, sent: result.sent, mode: note });
+    ok(res, { ok:true, sent: result.sent, mode: note, via: result.via });
   }catch(e){ err(res, 500, e.message || 'Email failed'); }
 });
 
