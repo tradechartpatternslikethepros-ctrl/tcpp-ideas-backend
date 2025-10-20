@@ -1,10 +1,10 @@
 {
   "name": "tcpp-ideas-backend",
+  "version": "1.0.0",
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node server.cjs"     
-    // "start": "node server/server.cjs"  
+    "start": "node server.cjs"
   },
   "dependencies": {
     "cors": "^2.8.5",
