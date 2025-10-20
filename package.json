@@ -3,8 +3,8 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node server.cjs"      // <-- if the file is at repo root
-    // "start": "node server/server.cjs"  // <-- use this instead if your file lives in server/server.cjs
+    "start": "node server.cjs"     
+    // "start": "node server/server.cjs"  
   },
   "dependencies": {
     "cors": "^2.8.5",
