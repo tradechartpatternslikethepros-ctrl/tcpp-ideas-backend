@@ -337,7 +337,6 @@ app.delete('/ideas/:id', requireAuth, async (req, res) => {
 });
 
 /* ---------------------- LIKES --------------------- */
-// Primary route
 async function likeHandler(req, res) {
   const action      = String(req.body?.action || req.body?.op || '').toLowerCase();
   const userId      = String(req.body?.userId || req.body?.by || '').slice(0, 120);
@@ -368,7 +367,6 @@ async function likeHandler(req, res) {
   ok(res, { likeCount: it.likes.count, likes: { count: it.likes.count } });
 }
 app.put('/ideas/:id/likes', requireAuth, likeHandler);
-// Friendly aliases to match various clients
 app.post('/ideas/:id/likes', requireAuth, likeHandler);
 app.put('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 app.post('/ideas/:id/likes/toggle', requireAuth, likeHandler);
@@ -466,8 +464,6 @@ app.post('/subscribe', requireAuth, async (req, res) => {
   const out = await subscribeCore(email, name);
   ok(res, out);
 });
-
-// Friendly aliases to match clients that probe multiple endpoints
 app.post('/api/subscribe', requireAuth, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const name  = String(req.body?.name || 'Member').trim();
@@ -545,45 +541,223 @@ function packToBcc(all) {
   return { to: uniqd[0], bcc: uniqd.slice(1) };
 }
 
-function emailTemplatePost(item) {
-  const title  = item.title || 'New idea';
-  const symbol = item.symbol || '';
-  const levels = item.levelText || '';
-  const take   = item.take || '';
-  const link   = item.link || '';
-  const imgUrl = item.imageUrl || (Array.isArray(item.media) && item.media[0] && item.media[0].url) || '';
-  const viewUrl = link || `${SITE_URL}`;
-  return `
-  <div style="font-family:Inter,Arial,Helvetica,sans-serif;max-width:660px;margin:0 auto;color:#0b1220">
-    <div style="padding:18px 0;text-align:center">
-      <img src="${LOGO_URL}" alt="${SITE_NAME}" style="height:42px"/>
-    </div>
-    <div style="background:#0b1220;color:#e9eefb;border-radius:14px;padding:18px;border:1px solid rgba(255,255,255,.08)">
-      <div style="font-size:14px;opacity:.8;margin-bottom:8px">${SITE_NAME}</div>
-      <h2 style="margin:0 0 8px 0">${title}</h2>
-      ${symbol ? `<div style="margin:4px 0 12px 0;font-weight:700">${symbol}</div>` : ''}
-      ${levels ? `<div style="margin:8px 0 12px 0"><strong>Levels:</strong><br>${levels.replace(/;/g,'; ')}</div>`:''}
-      ${take   ? `<div style="margin:8px 0 12px 0"><strong>Plan:</strong><br>${take}</div>`:''}
-      ${imgUrl ? `<div style="margin:10px 0"><img src="${imgUrl}" alt="Chart" style="max-width:100%;border-radius:10px;border:1px solid rgba(255,255,255,.12)"/></div>`:''}
-      <a href="${viewUrl}" style="display:inline-block;margin-top:4px;padding:10px 14px;background:#00d0ff;color:#001018;text-decoration:none;border-radius:999px;font-weight:800">Open idea</a>
-    </div>
-    <div style="text-align:center;font-size:12px;color:#445;opacity:.8;margin-top:12px">
-      You’re receiving this update from ${SITE_NAME}.
-    </div>
-  </div>`;
-}
-function emailTemplateSignal(item) {
-  const title = item.title || 'New signal';
-  const base  = emailTemplatePost(item);
-  return base.replace('New idea:', 'Signal:').replace('New idea', title);
+/* ===================== EMAIL TEMPLATE (PREMIUM) ===================== */
+
+/** Escape HTML (safe text in emails) */
+function _esc(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
-/* Recipient resolution:
- * 1) If EMAIL_FORCE_ALL_TO set → send only there (great for testing)
- * 2) Else if subscribers exist → send to subscribers
- * 3) Else if actor.email exists in request → send to actor
- * Always BCC admin(s) if configured
- */
+/** Turn "a; b; c" or newlines into a compact bullet list */
+function _bullets(s) {
+  const parts = String(s || '')
+    .split(/\r?\n|[;•]\s*/g)
+    .map(x => x.trim())
+    .filter(Boolean);
+  if (!parts.length) return '';
+  return `<ul style="margin:8px 0 0 20px;padding:0">
+    ${parts.map(li => `<li style="margin:6px 0;line-height:1.45">${_esc(li)}</li>`).join('')}
+  </ul>`;
+}
+
+/** Prefer item.imageUrl, else first media url */
+function _firstImage(item) {
+  return item?.imageUrl ||
+    (Array.isArray(item?.media) && item.media[0] && item.media[0].url) || '';
+}
+
+/** Build deep link to dashboard that scrolls to the idea */
+function ideaDeepLink(item) {
+  const base = `${SITE_URL}/trading-dashboard`;
+  const id   = String(item?.id || '').trim();
+  if (!id) return base;
+  const q    = `?idea=${encodeURIComponent(id)}&utm_source=email&utm_medium=notification&utm_campaign=${encodeURIComponent(item?.symbol ? 'idea-'+item.symbol : 'idea')}`;
+  return `${base}${q}`;
+}
+
+/** Premium, minimalist email shell */
+function _emailShell({ preheader, title, symbol, levelsHTML, planHTML, imgUrl, ctaHref, ctaText, badgeText }) {
+  const logo = LOGO_URL;
+  const brand = MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
+  const hasImg = !!imgUrl;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="x-apple-disable-message-reformatting">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${_esc(title)}</title>
+  </head>
+  <body style="margin:0;padding:0;background:#0a0f1a;">
+    <!-- Preheader (hidden) -->
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent">
+      ${_esc(preheader || title)}
+    </div>
+
+    <!-- Outer wrapper -->
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0a0f1a;padding:24px 14px">
+      <tr>
+        <td align="center">
+
+          <!-- Container -->
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:680px;background:#0b1220;border-radius:18px;border:1px solid rgba(255,255,255,0.06);box-shadow:0 6px 28px rgba(0,0,0,0.35);overflow:hidden">
+            <!-- Header -->
+            <tr>
+              <td align="center" style="padding:22px 20px 8px 20px;background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0));">
+                <a href="${_esc(SITE_URL)}" style="text-decoration:none;display:inline-block" target="_blank" rel="noopener">
+                  <img src="${_esc(logo)}" alt="${_esc(brand)}" width="220" style="display:block;width:220px;max-width:220px;height:auto;">
+                </a>
+                ${badgeText ? `
+                <div style="margin:14px auto 0 auto;display:inline-block;padding:6px 12px;border-radius:999px;
+                            background:rgba(255,255,255,0.06);color:#dce6ff;font-weight:700;font-size:12px;letter-spacing:.35px;
+                            text-transform:uppercase;">
+                  ${_esc(badgeText)}
+                </div>` : ''}
+              </td>
+            </tr>
+
+            <!-- Hero image (optional) -->
+            ${hasImg ? `
+            <tr>
+              <td style="padding:8px 20px 0 20px">
+                <img src="${_esc(imgUrl)}" alt="Chart" width="640"
+                     style="display:block;width:100%;max-width:640px;height:auto;border-radius:14px;
+                            border:1px solid rgba(255,255,255,0.08);">
+              </td>
+            </tr>` : ''}
+
+            <!-- Content -->
+            <tr>
+              <td style="padding:18px 20px 8px 20px;color:#e8eefc;font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;">
+                ${symbol ? `
+                  <div style="margin:2px 0 10px 0">
+                    <span style="display:inline-block;background:#0fd5ff12;color:#9be8ff;border:1px solid #0fd5ff38;
+                                padding:6px 10px;border-radius:999px;font-weight:700;font-size:12px;letter-spacing:.2px;">
+                      ${_esc(symbol)}
+                    </span>
+                  </div>` : ''}
+
+                <h1 style="margin:0 0 8px 0;font-size:22px;line-height:1.3;color:#f5f8ff;font-weight:800;">
+                  ${_esc(title)}
+                </h1>
+
+                ${levelsHTML ? `
+                  <div style="margin:12px 0 10px 0;padding:12px 14px;border-radius:12px;background:rgba(255,255,255,0.03);
+                              border:1px dashed rgba(255,255,255,0.08);">
+                    <div style="font-size:12px;color:#99a6c7;letter-spacing:.3px;text-transform:uppercase;font-weight:700;margin-bottom:6px">
+                      Levels
+                    </div>
+                    ${levelsHTML}
+                  </div>` : ''}
+
+                ${planHTML ? `
+                  <div style="margin:12px 0 0 0;">
+                    <div style="font-size:12px;color:#99a6c7;letter-spacing:.3px;text-transform:uppercase;font-weight:700;margin-bottom:6px">
+                      Plan
+                    </div>
+                    ${planHTML}
+                  </div>` : ''}
+              </td>
+            </tr>
+
+            <!-- CTA -->
+            <tr>
+              <td align="left" style="padding:8px 20px 24px 20px">
+                <table role="presentation" cellpadding="0" cellspacing="0">
+                  <tr>
+                    <td>
+                      <a href="${_esc(ctaHref)}"
+                         style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;
+                                text-decoration:none;border-radius:999px;font-weight:900;font-size:14px"
+                         target="_blank" rel="noopener">
+                        ${_esc(ctaText || 'Open on Dashboard')}
+                      </a>
+                    </td>
+                    <td width="12"></td>
+                    <td>
+                      <a href="${_esc(SITE_URL)}"
+                         style="display:inline-block;padding:12px 16px;background:transparent;color:#cfe8ff;
+                                text-decoration:none;border-radius:999px;font-weight:700;font-size:14px;
+                                border:1px solid rgba(255,255,255,0.14)"
+                         target="_blank" rel="noopener">
+                        Visit Site
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <!-- Footer -->
+            <tr>
+              <td style="padding:14px 20px 20px 20px;color:#8fa0c6;font-size:12px;border-top:1px solid rgba(255,255,255,0.06);">
+                <div style="opacity:.9">
+                  You’re receiving this update from ${_esc(brand)}.
+                </div>
+                <div style="opacity:.6;margin-top:6px">
+                  This notification links to your dashboard and will <em>auto-scroll</em> to the idea.
+                </div>
+              </td>
+            </tr>
+
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
+}
+
+/** Build a premium "Idea" email */
+function emailTemplatePost(item) {
+  const title   = item?.title || 'New Idea';
+  const symbol  = item?.symbol || '';
+  const levels  = _bullets(item?.levelText || item?.levels || '');
+  const plan    = _bullets(item?.take || item?.content || '');
+  const imgUrl  = _firstImage(item);
+  const deepURL = ideaDeepLink(item);
+  const pre     = `${symbol ? symbol + ' • ' : ''}${title}`;
+  return _emailShell({
+    preheader: `New Idea — ${pre}`,
+    title,
+    symbol,
+    levelsHTML: levels,
+    planHTML: plan,
+    imgUrl,
+    ctaHref: deepURL,
+    ctaText: 'Open on Dashboard',
+    badgeText: '🔔 New Idea'
+  });
+}
+
+/** Build a premium "Signal" email */
+function emailTemplateSignal(item) {
+  const title   = item?.title || 'New Signal';
+  const symbol  = item?.symbol || '';
+  const levels  = _bullets(item?.levelText || '');
+  const plan    = _bullets(item?.take || '');
+  const imgUrl  = _firstImage(item);
+  const deepURL = ideaDeepLink(item);
+  const pre     = `${symbol ? symbol + ' • ' : ''}${title}`;
+  return _emailShell({
+    preheader: `Signal — ${pre}`,
+    title,
+    symbol,
+    levelsHTML: levels,
+    planHTML: plan,
+    imgUrl,
+    ctaHref: deepURL,
+    ctaText: 'View Signal',
+    badgeText: '⚡️ Signal'
+  });
+}
+
+/* Recipient resolution (with admin fallback + actorEmail + logging) */
 async function resolveRecipients(reqBody) {
   const forced = splitEmails(EMAIL_FORCE_ALL_TO);
   if (forced.length) return { list: forced, note: 'forced' };
@@ -595,8 +769,11 @@ async function resolveRecipients(reqBody) {
 
   if (subList.length) return { list: subList, note: 'subscribers' };
 
-  const actorEmail = String(reqBody?.actor?.email || '').trim().toLowerCase();
+  const actorEmail = String(reqBody?.actor?.email || reqBody?.actorEmail || '').trim().toLowerCase();
   if (EMAIL_RX.test(actorEmail)) return { list: [actorEmail], note: 'actor' };
+
+  const admins = (EMAIL_BCC_ADMIN || []).filter(e => EMAIL_RX.test(e));
+  if (admins.length) return { list: admins, note: 'admin-fallback' };
 
   return { list: [], note: 'none' };
 }
@@ -679,9 +856,11 @@ app.post('/email/post', requireAuth, async (req, res) => {
     if (!item) return err(res, 400, 'item required');
 
     const { list, note } = await resolveRecipients(req.body || {});
-    if (!list.length) return ok(res, { ok:true, sent:0, info:'no recipients' });
+    console.log('[email][post] recipients:', note, list.length, list.slice(0, 3));
 
-    const subject = `New idea: ${item.symbol ? `${item.symbol} — `:''}${item.title||'Update'}`;
+    if (!list.length) return ok(res, { ok:true, sent:0, info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)' });
+
+    const subject = `🔔 New Idea: ${item.symbol ? `${item.symbol} — `:''}${item.title||'Update'}`;
     const html = emailTemplatePost(item);
 
     const result = await sendEmailBlast({ subject, html, toList:list });
@@ -695,14 +874,66 @@ app.post('/email/signal', requireAuth, async (req, res) => {
     if (!item) return err(res, 400, 'item required');
 
     const { list, note } = await resolveRecipients(req.body || {});
-    if (!list.length) return ok(res, { ok:true, sent:0, info:'no recipients' });
+    console.log('[email][signal] recipients:', note, list.length, list.slice(0, 3));
 
-    const subject = `Signal: ${item.symbol ? `${item.symbol} — `:''}${item.title||'Update'}`;
+    if (!list.length) return ok(res, { ok:true, sent:0, info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)' });
+
+    const subject = `⚡️ Signal: ${item.symbol ? `${item.symbol} — `:''}${item.title||'Update'}`;
     const html = emailTemplateSignal(item);
 
     const result = await sendEmailBlast({ subject, html, toList:list });
     ok(res, { ok:true, sent: result.sent, mode: note, via: result.via });
   }catch(e){ err(res, 500, e.message || 'Email failed'); }
+});
+
+/* ---------------------- DEBUG EMAIL -------------- */
+app.get('/debug/email/status', requireAuth, (req, res) => {
+  ok(res, {
+    smtp: {
+      ready: !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true)),
+      host: SMTP_HOST || null,
+      port: SMTP_PORT || null,
+      secure: SMTP_SECURE,
+      hasUser: !!SMTP_USER,
+      hasPass: !!SMTP_PASS,
+    },
+    branding: {
+      siteUrl: SITE_URL,
+      logo: LOGO_URL,
+      from: fromHeader(),
+      bccAdmins: EMAIL_BCC_ADMIN,
+      forceTo: EMAIL_FORCE_ALL_TO || null
+    }
+  });
+});
+
+app.post('/debug/email/test', requireAuth, async (req, res) => {
+  try {
+    const rawTo = req.query.to || req.body?.to || EMAIL_FORCE_ALL_TO || (EMAIL_BCC_ADMIN || []).join(',');
+    const toList = splitEmails(rawTo);
+    if (!toList.length) return err(res, 400, 'provide ?to= or set EMAIL_FORCE_ALL_TO or EMAIL_BCC_ADMIN');
+
+    const html = _emailShell({
+      preheader: 'Test notification from Ideas Backend',
+      title: 'Test Email — Looks Good',
+      symbol: 'OANDA:TEST',
+      levelsHTML: _bullets('PRZ 2345–2351; T1 2321; SL 2359'),
+      planHTML: _bullets('Short on rejection; Risk ≤1%'),
+      imgUrl: '',
+      ctaHref: `${SITE_URL}/trading-dashboard`,
+      ctaText: 'Open Dashboard',
+      badgeText: 'Test'
+    });
+
+    const result = await sendEmailBlast({
+      subject: 'Test — Ideas Backend Email',
+      html,
+      toList
+    });
+    ok(res, { ok:true, sent: result.sent, via: result.via });
+  } catch (e) {
+    err(res, 500, e.message || 'Test email failed');
+  }
 });
 
 /* ----------------------- UPLOAD ------------------- */
@@ -724,7 +955,7 @@ async function start() {
 
   app.listen(PORT, () => {
     console.log(`[tcpp-ideas-backend] listening on :${PORT} env=${NODE_ENV} data=${DATA_FILE}`);
-    console.log(`SSE: /events  CRUD: /ideas  Latest: /ideas/latest  Upload: /upload  Subs: /subscribe  Email: /email/post,/email/signal`);
+    console.log(`SSE: /events  CRUD: /ideas  Latest: /ideas/latest  Upload: /upload  Subs: /subscribe  Email: /email/post,/email/signal  Debug: /debug/email/status,/debug/email/test`);
   });
 }
 start();
