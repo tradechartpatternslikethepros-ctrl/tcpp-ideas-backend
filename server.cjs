@@ -60,8 +60,11 @@ const LOGO_URL    = process.env.EMAIL_LOGO_URL
   || 'https://static.wixstatic.com/media/e09166_90ddc4c3b20d4b4b83461681f85d9dd8~mv2.png';
 
 /* Theme + asset base (absolute URLs for images in emails) */
-const ASSET_BASE_URL = process.env.ASSET_BASE_URL || SITE_URL;   // e.g. https://api.yourdomain.com
-const EMAIL_THEME    = (process.env.EMAIL_THEME || 'dark').toLowerCase(); // 'dark' | 'clear'
+const ASSET_BASE_URL = process.env.ASSET_BASE_URL || SITE_URL;   // e.g. https://www.tradechartpatternslikethepros.com
+const UPLOADS_PUBLIC_BASE_URL = process.env.UPLOADS_PUBLIC_BASE_URL || ASSET_BASE_URL; // e.g. https://ideas-backend-production.up.railway.app
+const EMAIL_THEME    = (process.env.EMAIL_THEME || 'clear').toLowerCase(); // 'dark' | 'clear' | 'white'  (default clear/transparent)
+const EMAIL_BODY_BG  = (process.env.EMAIL_BODY_BG || '').trim(); // optional CSS color override
+const EMAIL_LAYOUT   = (process.env.EMAIL_LAYOUT || 'hero-first').toLowerCase(); // 'hero-first' puts chart first
 
 /* ---------------------- UTIL ---------------------- */
 const nowISO = () => new Date().toISOString();
@@ -73,7 +76,12 @@ function err(res, code, msg) { res.status(code).json({ status:'error', code, mes
 function absUrl(u) {
   const s = String(u || '').trim();
   if (!s) return '';
+  if (/^data:image\//i.test(s)) return s;
   if (/^https?:\/\//i.test(s)) return s;
+  if (s.startsWith('/uploads/')) {
+    const baseU = (UPLOADS_PUBLIC_BASE_URL || ASSET_BASE_URL || SITE_URL).replace(/\/+$/,'');
+    return baseU + s;
+  }
   const base = (ASSET_BASE_URL || SITE_URL || '').replace(/\/+$/,'');
   return base + (s.startsWith('/') ? s : `/${s}`);
 }
@@ -229,7 +237,8 @@ function normalizeIdea(input) {
     levelText: String(input.levelText || input.levels || '').slice(0, 2000),
     take: String(input.take || input.content || '').slice(0, 4000),
     link: String(input.link || '').slice(0, 1024),
-    imageUrl: String(input.imageUrl || ''),
+    imageUrl: String(input.imageUrl || ''),       // optional
+    chartUrl: String(input.chartUrl || ''),       // NEW: allow direct chart URL (live feed/screenshot)
     media: Array.isArray(input.media) ? input.media.map(m => ({
       kind: String(m.kind || 'image'), url: String(m.url || '')
     })) : [],
@@ -248,7 +257,7 @@ function ideaPublic(it) {
     id: it.id, type: it.type, status: it.status,
     title: it.title, symbol: it.symbol,
     levelText: it.levelText, take: it.take,
-    link: it.link, imageUrl: it.imageUrl, media: it.media,
+    link: it.link, imageUrl: it.imageUrl, chartUrl: it.chartUrl, media: it.media,
     authorName: it.authorName, authorEmail: it.authorEmail,
     createdAt: it.createdAt, updatedAt: it.updatedAt,
     likeCount: it.likes?.count || 0,
@@ -305,6 +314,7 @@ app.patch('/ideas/:id', requireAuth, async (req, res) => {
     take:      req.body.take      ?? it.take,
     link:      req.body.link      ?? it.link,
     imageUrl:  (typeof req.body.imageUrl === 'string' ? req.body.imageUrl : it.imageUrl),
+    chartUrl:  (typeof req.body.chartUrl === 'string' ? req.body.chartUrl : it.chartUrl),
     media: Array.isArray(req.body.media) ? req.body.media : it.media,
     updatedAt: nowISO()
   });
@@ -411,64 +421,6 @@ app.patch('/ideas/:id/comments/:cid', requireAuth, _commentEdit);
 app.put  ('/ideas/:id/comments/:cid', requireAuth, _commentEdit);
 app.delete('/ideas/:id/comments/:cid', requireAuth, _commentDelete);
 
-/* ------------------ SUBSCRIBERS ------------------- */
-app.get('/subscribers', requireAuth, async (_req, res) => {
-  const s = await loadSubs();
-  ok(res, { count: s.subs.length, items: s.subs });
-});
-async function subscribeCore(email, name) {
-  const s = await loadSubs();
-  const exists = (s.subs || []).find(x => x.email === email);
-  if (!exists) (s.subs ||= []).push({ email, name, createdAt: nowISO(), status: 'active' });
-  await saveSubs(s);
-  return { ok: true };
-}
-async function unsubscribeCore(email) {
-  const s = await loadSubs();
-  s.subs = (s.subs || []).filter(x => x.email !== email);
-  await saveSubs(s);
-  return { ok: true };
-}
-app.post('/subscribe', requireAuth, async (req, res) => {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  const name  = String(req.body?.name || 'Member').trim();
-  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return err(res, 400, 'Valid email required');
-  const out = await subscribeCore(email, name);
-  ok(res, out);
-});
-app.post('/api/subscribe', requireAuth, async (req, res) => {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  const name  = String(req.body?.name || 'Member').trim();
-  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return err(res, 400, 'Valid email required');
-  const out = await subscribeCore(email, name);
-  ok(res, out);
-});
-app.post('/email/subscribe', requireAuth, async (req, res) => {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  const name  = String(req.body?.name || 'Member').trim();
-  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return err(res, 400, 'Valid email required');
-  const out = await subscribeCore(email, name);
-  ok(res, out);
-});
-app.post('/unsubscribe', requireAuth, async (req, res) => {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  if (!email) return err(res, 400, 'email required');
-  const out = await unsubscribeCore(email);
-  ok(res, out);
-});
-app.post('/api/unsubscribe', requireAuth, async (req, res) => {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  if (!email) return err(res, 400, 'email required');
-  const out = await unsubscribeCore(email);
-  ok(res, out);
-});
-app.post('/email/unsubscribe', requireAuth, async (req, res) => {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  if (!email) return err(res, 400, 'email required');
-  const out = await unsubscribeCore(email);
-  ok(res, out);
-});
-
 /* --------------------- EMAIL CORE ----------------- */
 function smtpReady() {
   return !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true));
@@ -510,7 +462,7 @@ function packToBcc(all) {
   return { to: uniqd[0], bcc: uniqd.slice(1) };
 }
 
-/* ===================== EMAIL TEMPLATE (THEMED) ===================== */
+/* ===================== EMAIL TEMPLATE (HERO-FIRST, TRANSPARENT) ===================== */
 function _esc(s) {
   return String(s || '')
     .replace(/&/g, '&amp;')
@@ -529,8 +481,12 @@ function _bullets(s) {
   </ul>`;
 }
 function _firstImage(item) {
-  const raw = item?.imageUrl ||
-    (Array.isArray(item?.media) && item.media[0] && item.media[0].url) || '';
+  const raw =
+    item?.chartUrl ||
+    item?.chartImage ||
+    item?.imageUrl ||
+    (Array.isArray(item?.media) && item.media[0] && item.media[0].url) ||
+    '';
   return absUrl(raw);
 }
 function ideaDeepLink(item) {
@@ -540,153 +496,149 @@ function ideaDeepLink(item) {
   const q    = `?idea=${encodeURIComponent(id)}&utm_source=email&utm_medium=notification&utm_campaign=${encodeURIComponent(item?.symbol ? 'idea-'+item.symbol : 'idea')}`;
   return `${base}${q}`;
 }
-function _emailShell({ preheader, title, symbol, levelsHTML, planHTML, imgUrl, ctaHref, ctaText, badgeText, theme }) {
-  const t = (theme || EMAIL_THEME);
-  const isClear = ['clear','transparent','none','minimal'].includes(t);
 
+/* Theme + layout engine */
+function _themeVars() {
+  const t = (EMAIL_THEME || 'clear').toLowerCase();
+  const layout = EMAIL_LAYOUT || 'hero-first';
+  const isWhite = t === 'white';
+  const isClear = t === 'clear' || t === 'transparent' || t === 'none' || t === 'minimal';
+  const isDark  = !isWhite && !isClear;
+
+  const bodyBg   = EMAIL_BODY_BG || (isWhite ? '#ffffff' : (isClear ? '' : '#0a0f1a'));
+  const wrapBg   = isWhite ? '#ffffff' : (isClear ? 'transparent' : '#0b1220');
+  const wrapBor  = isWhite ? '1px solid rgba(0,0,0,0.06)' : (isClear ? 'none' : '1px solid rgba(255,255,255,0.06)');
+  const text     = isWhite ? '#1a2233' : (isClear ? '#0b1220' : '#e8eefc');
+  const title    = isWhite ? '#0b1220' : (isClear ? '#0b1220' : '#f5f8ff');
+  const badgeBg  = isWhite ? 'rgba(0,0,0,0.05)' : (isClear ? 'rgba(0,0,0,0.05)' : 'rgba(255,255,255,0.06)');
+  const badgeTx  = isWhite ? '#0b1220' : (isClear ? '#0b1220' : '#dce6ff');
+  const pillBg   = isWhite ? 'rgba(0,122,255,0.10)' : (isClear ? 'rgba(0,208,255,0.10)' : '#0fd5ff12');
+  const pillBor  = isWhite ? '1px solid rgba(0,122,255,0.25)' : (isClear ? '1px solid rgba(0,208,255,0.35)' : '1px solid #0fd5ff38');
+  const pillTx   = isWhite ? '#08467a' : (isClear ? '#005a6a' : '#9be8ff');
+  const secBg    = isWhite ? 'rgba(0,0,0,0.03)' : (isClear ? 'rgba(0,0,0,0.03)' : 'rgba(255,255,255,0.03)');
+  const secBor   = isWhite ? '1px dashed rgba(0,0,0,0.08)' : (isClear ? '1px dashed rgba(0,0,0,0.08)' : '1px dashed rgba(255,255,255,0.08)');
+  const footBor  = isWhite ? '1px solid rgba(0,0,0,0.06)' : (isClear ? '1px solid rgba(0,0,0,0.06)' : '1px solid rgba(255,255,255,0.06)');
+  const footTx   = isWhite ? '#44526e' : (isClear ? '#3a4358' : '#8fa0c6');
+  const visitTx  = isWhite ? '#164a76' : (isClear ? '#164a76' : '#cfe8ff');
+  const visitBor = isWhite ? '1px solid rgba(0,0,0,0.12)' : (isClear ? '1px solid rgba(0,0,0,0.14)' : '1px solid rgba(255,255,255,0.14)');
+  const cardBor  = isWhite ? 'rgba(0,0,0,0.08)' : (isClear ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.08)');
+
+  return { layout, bodyBg, wrapBg, wrapBor, text, title, badgeBg, badgeTx, pillBg, pillBor, pillTx, secBg, secBor, footBor, footTx, visitTx, visitBor, cardBor, isClear, isWhite, isDark };
+}
+
+/* Shell: Chart first → Brand row (logo + name) → Title → Symbol pill → Sections → CTAs */
+/* Transparent/clear keeps the page background empty. */
+function _emailShell({ preheader, title, symbol, levelsHTML, planHTML, imgUrl, ctaHref, ctaText, badgeText }) {
+  const v = _themeVars();
   const logo = absUrl(LOGO_URL);
   const brand = MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
   const hasImg = !!imgUrl;
-
-  const bodyBg     = isClear ? '' : 'background:#0a0f1a;';
-  const container  = isClear
-    ? 'background:transparent;border:none;box-shadow:none;'
-    : 'background:#0b1220;border:1px solid rgba(255,255,255,0.06);box-shadow:0 6px 28px rgba(0,0,0,0.35);';
-  const headGrad   = isClear ? '' : 'background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0));';
-  const textColor  = isClear ? '#0b1220' : '#e8eefc';
-  const titleColor = isClear ? '#0b1220' : '#f5f8ff';
-  const badgeBg    = isClear ? 'rgba(0,0,0,0.05)' : 'rgba(255,255,255,0.06)';
-  const badgeColor = isClear ? '#0b1220' : '#dce6ff';
-  const pillBg     = isClear ? 'rgba(0,208,255,0.10)' : '#0fd5ff12';
-  const pillBor    = isClear ? '1px solid rgba(0,208,255,0.35)' : '1px solid #0fd5ff38';
-  const pillColor  = isClear ? '#005a6a' : '#9be8ff';
-  const secBg      = isClear ? 'rgba(0,0,0,0.03)' : 'rgba(255,255,255,0.03)';
-  const secBor     = isClear ? '1px dashed rgba(0,0,0,0.08)' : '1px dashed rgba(255,255,255,0.08)';
-  const footerBor  = isClear ? '1px solid rgba(0,0,0,0.06)' : '1px solid rgba(255,255,255,0.06)';
-  const footerTxt  = isClear ? '#3a4358' : '#8fa0c6';
-  const visitColor = isClear ? '#164a76' : '#cfe8ff';
-  const visitBor   = isClear ? '1px solid rgba(0,0,0,0.12)' : '1px solid rgba(255,255,255,0.14)';
+  const showHeroFirst = (v.layout === 'hero-first');
 
   return `<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="x-apple-disable-message-reformatting">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>${_esc(title)}</title>
-  </head>
-  <body style="margin:0;padding:0;${bodyBg}">
-    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent">
-      ${_esc(preheader || title)}
-    </div>
+<head>
+  <meta charset="utf-8">
+  <meta name="x-apple-disable-message-reformatting">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${_esc(title)}</title>
+</head>
+<body style="margin:0;padding:0;${v.bodyBg ? `background:${v.bodyBg};` : ''}">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent">
+    ${_esc(preheader || title)}
+  </div>
 
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="${isClear ? '' : 'background:#0a0f1a;'}padding:24px 14px">
-      <tr>
-        <td align="center">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="${v.isDark ? 'background:#0a0f1a;' : ''}padding:24px 14px">
+    <tr><td align="center">
 
-          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:680px;${container}border-radius:18px;overflow:hidden">
-            <tr>
-              <td align="center" style="padding:22px 20px 8px 20px;${headGrad}">
-                <a href="${_esc(SITE_URL)}" style="text-decoration:none;display:inline-block" target="_blank" rel="noopener">
-                  <img src="${_esc(logo)}" alt="${_esc(brand)}" width="220" style="display:block;width:220px;max-width:220px;height:auto;">
-                </a>
-                ${badgeText ? `
-                <div style="margin:14px auto 0 auto;display:inline-block;padding:6px 12px;border-radius:999px;
-                            background:${badgeBg};color:${badgeColor};font-weight:700;font-size:12px;letter-spacing:.35px;
-                            text-transform:uppercase;">
-                  ${_esc(badgeText)}
-                </div>` : ''}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:740px;background:${v.wrapBg};${v.wrapBor ? `border:${v.wrapBor};` : ''}border-radius:${v.isClear ? '0' : '18px'};overflow:hidden;box-shadow:${v.isWhite ? '0 6px 26px rgba(14,26,57,0.08)' : (v.isClear ? 'none' : '0 6px 28px rgba(0,0,0,0.35)')}">
+
+        ${showHeroFirst && hasImg ? `
+        <tr>
+          <td style="padding:0">
+            <img src="${_esc(imgUrl)}" alt="Chart" width="740"
+                 style="display:block;width:100%;max-width:740px;height:auto;${v.isClear ? '' : `border-bottom:1px solid ${v.cardBor};`}">
+          </td>
+        </tr>` : ''}
+
+        <tr>
+          <td style="padding:18px 22px 4px 22px;color:${v.text};font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;">
+            ${!showHeroFirst && hasImg ? `
+              <div style="margin-bottom:12px">
+                <img src="${_esc(imgUrl)}" alt="Chart" width="740"
+                     style="display:block;width:100%;max-width:740px;height:auto;border-radius:14px;border:1px solid ${v.cardBor}">
+              </div>` : ''}
+
+            <!-- Brand row (logo + brand) -->
+            <div style="display:flex;align-items:center;gap:10px;margin:0 0 8px 0">
+              <a href="${_esc(SITE_URL)}" target="_blank" rel="noopener" style="text-decoration:none;display:inline-flex;align-items:center;gap:10px">
+                <img src="${_esc(logo)}" alt="${_esc(brand)}" width="28" height="28"
+                     style="display:block;border-radius:8px;width:28px;height:28px;">
+                <span style="color:${v.text};font-weight:700;font-size:14px">${_esc(brand)}</span>
+              </a>
+              ${badgeText ? `<span style="margin-left:auto;display:inline-block;padding:6px 10px;border-radius:999px;background:${v.badgeBg};color:${v.badgeTx};font-weight:700;font-size:11px;letter-spacing:.35px;text-transform:uppercase;">${_esc(badgeText)}</span>` : ''}
+            </div>
+
+            <h1 style="margin:0 0 10px 0;font-size:24px;line-height:1.28;color:${v.title};font-weight:850;">
+              ${_esc(title)}
+            </h1>
+
+            ${symbol ? `
+              <div style="margin:6px 0 14px 0">
+                <span style="display:inline-block;background:${v.pillBg};color:${v.pillTx};border:${v.pillBor};
+                            padding:6px 10px;border-radius:999px;font-weight:800;font-size:12px;letter-spacing:.2px;">
+                  ${_esc(symbol)}
+                </span>
+              </div>` : ''}
+
+            ${levelsHTML ? `
+              <div style="margin:12px 0 10px 0;padding:12px 14px;border-radius:12px;background:${v.secBg};border:${v.secBor};">
+                <div style="font-size:12px;color:${v.isWhite ? '#5b6a8a' : '#99a6c7'};letter-spacing:.3px;text-transform:uppercase;font-weight:800;margin-bottom:6px">Levels</div>
+                ${levelsHTML}
+              </div>` : ''}
+
+            ${planHTML ? `
+              <div style="margin:12px 0 0 0;">
+                <div style="font-size:12px;color:${v.isWhite ? '#5b6a8a' : '#99a6c7'};letter-spacing:.3px;text-transform:uppercase;font-weight:800;margin-bottom:6px">Plan</div>
+                ${planHTML}
+              </div>` : ''}
+
+          </td>
+        </tr>
+
+        <tr>
+          <td align="left" style="padding:10px 22px 22px 22px">
+            <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+              <td>
+                <a href="${_esc(ctaHref)}"
+                   style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;text-decoration:none;border-radius:999px;font-weight:900;font-size:14px"
+                   target="_blank" rel="noopener">${_esc(ctaText || 'Open on Dashboard')}</a>
               </td>
-            </tr>
-
-            ${hasImg ? `
-            <tr>
-              <td style="padding:8px 20px 0 20px">
-                <img src="${_esc(imgUrl)}" alt="Chart" width="640"
-                     style="display:block;width:100%;max-width:640px;height:auto;border-radius:14px;
-                            border:1px solid ${isClear ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.08)'};">
+              <td width="12"></td>
+              <td>
+                <a href="${_esc(SITE_URL)}"
+                   style="display:inline-block;padding:12px 16px;background:transparent;color:${v.visitTx};text-decoration:none;border-radius:999px;font-weight:800;font-size:14px;border:${v.visitBor}"
+                   target="_blank" rel="noopener">Visit Site</a>
               </td>
-            </tr>` : ''}
+            </tr></table>
+          </td>
+        </tr>
 
-            <tr>
-              <td style="padding:18px 20px 8px 20px;color:${textColor};font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;">
-                ${symbol ? `
-                  <div style="margin:2px 0 10px 0">
-                    <span style="display:inline-block;background:${pillBg};color:${pillColor};border:${pillBor};
-                                padding:6px 10px;border-radius:999px;font-weight:700;font-size:12px;letter-spacing:.2px;">
-                      ${_esc(symbol)}
-                    </span>
-                  </div>` : ''}
+        <tr>
+          <td style="padding:14px 22px 20px 22px;color:${v.footTx};font-size:12px;${v.footBor ? `border-top:${v.footBor};` : ''}">
+            <div style="opacity:.9">You’re receiving this update from ${_esc(brand)}.</div>
+            <div style="opacity:.65;margin-top:6px">This notification links to your dashboard and will <em>auto-scroll</em> to the idea.</div>
+          </td>
+        </tr>
 
-                <h1 style="margin:0 0 8px 0;font-size:22px;line-height:1.3;color:${titleColor};font-weight:800;">
-                  ${_esc(title)}
-                </h1>
-
-                ${levelsHTML ? `
-                  <div style="margin:12px 0 10px 0;padding:12px 14px;border-radius:12px;background:${secBg};
-                              border:${secBor};">
-                    <div style="font-size:12px;color:${isClear ? '#5a6a8a' : '#99a6c7'};letter-spacing:.3px;text-transform:uppercase;font-weight:700;margin-bottom:6px">
-                      Levels
-                    </div>
-                    ${levelsHTML}
-                  </div>` : ''}
-
-                ${planHTML ? `
-                  <div style="margin:12px 0 0 0;">
-                    <div style="font-size:12px;color:${isClear ? '#5a6a8a' : '#99a6c7'};letter-spacing:.3px;text-transform:uppercase;font-weight:700;margin-bottom:6px">
-                      Plan
-                    </div>
-                    ${planHTML}
-                  </div>` : ''}
-              </td>
-            </tr>
-
-            <tr>
-              <td align="left" style="padding:8px 20px 24px 20px">
-                <table role="presentation" cellpadding="0" cellspacing="0">
-                  <tr>
-                    <td>
-                      <a href="${_esc(ctaHref)}"
-                         style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;
-                                text-decoration:none;border-radius:999px;font-weight:900;font-size:14px"
-                         target="_blank" rel="noopener">
-                        ${_esc(ctaText || 'Open on Dashboard')}
-                      </a>
-                    </td>
-                    <td width="12"></td>
-                    <td>
-                      <a href="${_esc(SITE_URL)}"
-                         style="display:inline-block;padding:12px 16px;background:transparent;color:${visitColor};
-                                text-decoration:none;border-radius:999px;font-weight:700;font-size:14px;
-                                border:${visitBor}"
-                         target="_blank" rel="noopener">
-                        Visit Site
-                      </a>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
-
-            <tr>
-              <td style="padding:14px 20px 20px 20px;color:${footerTxt};font-size:12px;border-top:${footerBor};">
-                <div style="opacity:.9">
-                  You’re receiving this update from ${_esc(brand)}.
-                </div>
-                <div style="opacity:.6;margin-top:6px">
-                  This notification links to your dashboard and will <em>auto-scroll</em> to the idea.
-                </div>
-              </td>
-            </tr>
-
-          </table>
-        </td>
-      </tr>
-    </table>
-  </body>
+      </table>
+    </td></tr>
+  </table>
+</body>
 </html>`;
 }
 
+/* Post + Signal wrappers */
 function emailTemplatePost(item) {
   const title   = item?.title || 'New Idea';
   const symbol  = item?.symbol || '';
@@ -704,11 +656,9 @@ function emailTemplatePost(item) {
     imgUrl,
     ctaHref: deepURL,
     ctaText: 'Open on Dashboard',
-    badgeText: '🔔 New Idea',
-    theme: EMAIL_THEME
+    badgeText: '🔔 New Idea'
   });
 }
-
 function emailTemplateSignal(item) {
   const title   = item?.title || 'New Signal';
   const symbol  = item?.symbol || '';
@@ -726,8 +676,7 @@ function emailTemplateSignal(item) {
     imgUrl,
     ctaHref: deepURL,
     ctaText: 'View Signal',
-    badgeText: '⚡️ Signal',
-    theme: EMAIL_THEME
+    badgeText: '⚡️ Signal'
   });
 }
 
@@ -844,7 +793,7 @@ app.post('/email/signal', requireAuth, async (req, res) => {
 });
 
 /* ---------------------- DEBUG EMAIL -------------- */
-app.get('/debug/email/status', requireAuth, (req, res) => {
+app.get('/debug/email/status', requireAuth, (_req, res) => {
   ok(res, {
     smtp: {
       ready: !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true)),
@@ -861,7 +810,10 @@ app.get('/debug/email/status', requireAuth, (req, res) => {
       bccAdmins: EMAIL_BCC_ADMIN,
       forceTo: EMAIL_FORCE_ALL_TO || null,
       assetBaseUrl: ASSET_BASE_URL,
-      emailTheme: EMAIL_THEME
+      uploadsPublicBaseUrl: UPLOADS_PUBLIC_BASE_URL,
+      emailTheme: EMAIL_THEME,
+      emailLayout: EMAIL_LAYOUT,
+      emailBodyBg: EMAIL_BODY_BG || null
     }
   });
 });
@@ -877,15 +829,14 @@ app.post('/debug/email/test', requireAuth, async (req, res) => {
 
     const html = _emailShell({
       preheader: 'Test notification from Ideas Backend',
-      title: `Test Email — ${EMAIL_THEME === 'clear' ? 'Transparent' : 'Dark'} Theme`,
+      title: `Test Email — ${EMAIL_THEME}`,
       symbol: 'OANDA:TEST',
       levelsHTML: _bullets('PRZ 2345–2351; T1 2321; SL 2359'),
       planHTML: _bullets('Short on rejection; Risk ≤1%'),
       imgUrl,
       ctaHref: `${SITE_URL}/trading-dashboard`,
       ctaText: 'Open Dashboard',
-      badgeText: 'Test',
-      theme: EMAIL_THEME
+      badgeText: 'Test'
     });
 
     const result = await sendEmailBlast({
