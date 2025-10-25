@@ -20,16 +20,16 @@ const crypto = require('crypto');
 const PORT      = process.env.PORT || 8080;
 const NODE_ENV  = process.env.NODE_ENV || 'production';
 
-const API_TOKEN = process.env.API_TOKEN || '';
-const JWT_SECRET= process.env.JWT_SECRET || ''; // <-- must match your Wix Secret "JWT_SECRET"
+const API_TOKEN  = process.env.API_TOKEN || '';
+const JWT_SECRET = process.env.JWT_SECRET || ''; // must match Wix Secret "JWT_SECRET"
 
-const _corsEnv  = process.env.CORS_ORIGINS || process.env.CORS_ALLOW_ORIGINS || '*';
+const _corsEnv   = process.env.CORS_ORIGINS || process.env.CORS_ALLOW_ORIGINS || '*';
 const CORS_ORIGINS = _corsEnv.split(',').map(s => s.trim()).filter(Boolean);
 
-const DATA_DIR    = process.env.DATA_DIR   || '/data';
-const DATA_FILE   = path.join(DATA_DIR, 'ideas.json');
-const SUBS_FILE   = path.join(DATA_DIR, 'subscribers.json');
-const UPLOAD_DIR  = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
+const DATA_DIR   = process.env.DATA_DIR   || '/data';
+const DATA_FILE  = path.join(DATA_DIR, 'ideas.json');
+const SUBS_FILE  = path.join(DATA_DIR, 'subscribers.json');
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
 
 const UPLOADS_PUBLIC_BASE_URL = (process.env.UPLOADS_PUBLIC_BASE_URL || '').replace(/\/+$/,'');
 
@@ -37,7 +37,7 @@ const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 8);
 const ALLOWED_UPLOAD_TYPES = (process.env.ALLOWED_UPLOAD_TYPES
   || 'image/png,image/jpeg,image/webp,image/gif').split(',').map(s => s.trim());
 
-/* ---------------------- EMAIL -------------------- */
+/* ---------------------- EMAIL ENV ---------------- */
 const SMTP_HOST   = process.env.SMTP_HOST   || '';
 const SMTP_PORT   = Number(process.env.SMTP_PORT || 587);
 const SMTP_SECURE = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || SMTP_PORT === 465;
@@ -63,9 +63,19 @@ const EMAIL_THEME    = (process.env.EMAIL_THEME || 'dark').toLowerCase();
 
 /* ---------------------- UTIL ---------------------- */
 const nowISO = () => new Date().toISOString();
-async function ensureDir(p) { await fsp.mkdir(p, { recursive: true }).catch(() => {}); }
-function ok(res, data) { res.json(data); }
-function err(res, code, msg) { res.status(code).json({ status:'error', code, message: msg || 'Error' }); }
+
+async function ensureDir(p) {
+  await fsp.mkdir(p, { recursive: true }).catch(() => {});
+}
+
+function ok(res, data) {
+  res.json(data);
+}
+
+function err(res, code, msg) {
+  res.status(code).json({ status:'error', code, message: msg || 'Error' });
+}
+
 function absUrl(u) {
   const s = String(u || '').trim();
   if (!s) return '';
@@ -73,17 +83,21 @@ function absUrl(u) {
   const base = (UPLOADS_PUBLIC_BASE_URL || ASSET_BASE_URL || SITE_URL || '').replace(/\/+$/,'');
   return base + (s.startsWith('/') ? s : `/${s}`);
 }
+
 const EMAIL_RX = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const uniq = a => Array.from(new Set(a || []));
 
-// small, safe id
-function uid(n=12){ return crypto.randomBytes(n).toString('base64url').slice(0,n); }
+// small, safe id (avoids ESM nanoid issue)
+function uid(n=12){
+  return crypto.randomBytes(n).toString('base64url').slice(0,n);
+}
 
 function nnum(v){
   if (v == null) return null;
   const n = Number(String(v).replace(/[^\d.\-]/g, ''));
   return Number.isFinite(n) ? n : null;
 }
+
 function parseTargets(v){
   if (Array.isArray(v)) return v.map(nnum).filter(Number.isFinite);
   const s = String(v || '');
@@ -93,7 +107,6 @@ function parseTargets(v){
 
 /* -------------------- STORAGE -------------------- */
 const blankDB   = () => ({ ideas: [] });
-const blankSubs = () => ({ subs: [] });
 
 async function loadDB() {
   try {
@@ -102,8 +115,11 @@ async function loadDB() {
     if (!raw) return blankDB();
     const j = JSON.parse(raw);
     return (j && Array.isArray(j.ideas)) ? j : blankDB();
-  } catch { return blankDB(); }
+  } catch {
+    return blankDB();
+  }
 }
+
 async function saveDB(db) {
   await ensureDir(DATA_DIR);
   const tmp = DATA_FILE + '.tmp';
@@ -117,16 +133,25 @@ function readBearer(req) {
   if (h && /^Bearer\s+/i.test(h)) return h.replace(/^Bearer\s+/i, '').trim();
   return '';
 }
+
 function readQueryToken(req) {
   return (req.query && String(req.query.token || '').trim()) || '';
 }
 
 function decodeUser(token){
   if (!token) return null;
+
   // Legacy static token => admin
   if (API_TOKEN && token === API_TOKEN) {
-    return { id:'admin', name:'Admin', email:'admin@local', role:'admin', via:'api-token' };
+    return {
+      id:'admin',
+      name:'Admin',
+      email:'admin@local',
+      role:'admin',
+      via:'api-token'
+    };
   }
+
   // JWT (from Wix backend)
   if (JWT_SECRET) {
     try {
@@ -141,6 +166,7 @@ function decodeUser(token){
       };
     } catch (_) {}
   }
+
   return null;
 }
 
@@ -152,14 +178,18 @@ function readUser(req){
 function requireUser(req, res, next){
   const u = readUser(req);
   if (!u) return err(res, 401, 'Unauthorized');
-  req.user = u; next();
+  req.user = u;
+  next();
 }
+
 function requireAdmin(req, res, next){
   const u = readUser(req);
   if (!u) return err(res, 401, 'Unauthorized');
   if (u.role !== 'admin') return err(res, 403, 'Forbidden');
-  req.user = u; next();
+  req.user = u;
+  next();
 }
+
 function sseAuthOK(req) {
   const t = readQueryToken(req);
   if (!API_TOKEN && !JWT_SECRET) return true; // open if no auth configured
@@ -168,10 +198,14 @@ function sseAuthOK(req) {
 
 /* ----------------------- SSE ---------------------- */
 const clients = new Set(); // { id, res, ping }
+
 function sseSend(event, data) {
   const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const c of clients) { try { c.res.write(line); } catch {} }
+  for (const c of clients) {
+    try { c.res.write(line); } catch {}
+  }
 }
+
 function sseSendTo(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
@@ -184,71 +218,102 @@ function isOriginAllowed(origin) {
   if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return true;
   try {
     const { protocol, host } = new URL(origin);
-    if (host.endsWith('.wixsite.com')) return protocol === 'https:';
-    if (host.endsWith('.filesusr.com')) return protocol === 'https:';
+
+    if (host.endsWith('.wixsite.com'))    return protocol === 'https:';
+    if (host.endsWith('.filesusr.com'))  return protocol === 'https:';
+
     for (const pat of CORS_ORIGINS) {
       if (!pat.includes('*')) continue;
       const m = pat.match(/^https?:\/\/\*\.(.+)$/i);
       if (m && host.endsWith(m[1])) return protocol === 'https:';
     }
+
     if (/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host)) return true;
   } catch {}
   return false;
 }
-app.use(cors({ origin: (origin, cb) => cb(null, isOriginAllowed(origin)), credentials: false }));
+
+app.use(cors({
+  origin: (origin, cb) => cb(null, isOriginAllowed(origin)),
+  credentials: false
+}));
+
 app.use(express.json({ limit: '1mb' }));
 
+// public uploaded images
 app.use('/uploads', express.static(UPLOAD_DIR, {
-  index: false, maxAge: '30d',
-  setHeaders: res => res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
+  index: false,
+  maxAge: '30d',
+  setHeaders: res => {
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  }
 }));
 
 /* ---------------------- HEALTH ------------------- */
-app.get('/health', (_req, res) => ok(res, { ok: true, env: NODE_ENV, time: nowISO() }));
+app.get('/health', (_req, res) => ok(res, {
+  ok: true,
+  env: NODE_ENV,
+  time: nowISO()
+}));
 
 /* ---------------------- EVENTS (SSE) ------------- */
 app.get('/events', (req, res) => {
   if (!sseAuthOK(req)) return err(res, 401, 'Unauthorized');
+
   res.set({
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no'
   });
-  res.flushHeaders?.();
+
+  // flushHeaders() isn't always there, so optional-call
+  res.flushHeaders && res.flushHeaders();
+
   const id = uid(10);
   const client = { id, res, ping: null };
   clients.add(client);
+
   sseSendTo(res, 'hello', { id, at: nowISO() });
-  client.ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
-  req.on('close', () => { clearInterval(client.ping); clients.delete(client); });
+
+  client.ping = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch {}
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(client.ping);
+    clients.delete(client);
+  });
 });
 
 /* -------------------- NORMALIZATION -------------- */
 function normalizeDirection(v) {
   const s = String(v || '').toLowerCase();
-  if (s === 'long' || s === 'buy') return 'long';
+  if (s === 'long'  || s === 'buy')  return 'long';
   if (s === 'short' || s === 'sell') return 'short';
   return 'neutral';
 }
+
 function firstImageUrl(item) {
   const raw = item?.imageUrl ||
     (Array.isArray(item?.media) && item.media[0] && item.media[0].url) || '';
   return absUrl(raw);
 }
+
 function ideaDeepLink(item) {
   const base = `${SITE_URL}/trading-dashboard`;
   const id   = String(item?.id || '').trim();
   if (!id) return base;
-  const q    = `?idea=${encodeURIComponent(id)}&utm_source=email&utm_medium=notification&utm_campaign=${encodeURIComponent(item?.symbol ? 'idea-'+item.symbol : 'idea')}`;
+  const q = `?idea=${encodeURIComponent(id)}&utm_source=email&utm_medium=notification&utm_campaign=${
+    encodeURIComponent(item?.symbol ? 'idea-'+item.symbol : 'idea')}`;
   return `${base}${q}`;
 }
 
 function normalizeIdea(input, author /* {id,name,email} */) {
   const now = nowISO();
   const dir = normalizeDirection(input.direction || input.bias);
-  const entry = nnum(input.entryLevel ?? input.entry ?? input.el);
-  const stop  = nnum(input.stopLevel  ?? input.stop  ?? input.sl);
+  const entry   = nnum(input.entryLevel ?? input.entry ?? input.el);
+  const stop    = nnum(input.stopLevel  ?? input.stop  ?? input.sl);
   const targets = parseTargets(input.targets ?? input.targetText ?? input.tps ?? input.tp);
 
   return {
@@ -261,9 +326,12 @@ function normalizeIdea(input, author /* {id,name,email} */) {
     take: String(input.take || input.content || '').slice(0, 4000),
     link: String(input.link || '').slice(0, 1024),
     imageUrl: String(input.imageUrl || input.img || ''),
-    media: Array.isArray(input.media) ? input.media.map(m => ({
-      kind: String(m.kind || 'image'), url: String(m.url || '')
-    })) : [],
+    media: Array.isArray(input.media)
+      ? input.media.map(m => ({
+          kind: String(m.kind || 'image'),
+          url: String(m.url || '')
+        }))
+      : [],
     direction: dir,
     metrics: {
       entry: entry ?? null,
@@ -286,12 +354,19 @@ function normalizeIdea(input, author /* {id,name,email} */) {
     updatedAt: now
   };
 }
+
 function ideaPublic(it, you){
   return {
-    id: it.id, type: it.type, status: it.status,
-    title: it.title, symbol: it.symbol,
-    levelText: it.levelText, take: it.take,
-    link: it.link, imageUrl: it.imageUrl, media: it.media,
+    id: it.id,
+    type: it.type,
+    status: it.status,
+    title: it.title,
+    symbol: it.symbol,
+    levelText: it.levelText,
+    take: it.take,
+    link: it.link,
+    imageUrl: it.imageUrl,
+    media: it.media,
     direction: it.direction || 'neutral',
     metrics: it.metrics ? {
       entry: it.metrics.entry ?? null,
@@ -302,55 +377,79 @@ function ideaPublic(it, you){
       statusLight: it.metrics.statusLight || 'gray',
       statusNote: it.metrics.statusNote || '',
       hitStop: !!it.metrics.hitStop,
-      hitTargetIndex: Number.isFinite(it.metrics.hitTargetIndex) ? it.metrics.hitTargetIndex : null
+      hitTargetIndex: Number.isFinite(it.metrics.hitTargetIndex)
+        ? it.metrics.hitTargetIndex
+        : null
     } : undefined,
-    authorName: it.authorName, authorEmail: it.authorEmail,
-    createdAt: it.createdAt, updatedAt: it.updatedAt,
+    authorName: it.authorName,
+    authorEmail: it.authorEmail,
+    createdAt: it.createdAt,
+    updatedAt: it.updatedAt,
     likeCount: it.likes?.count || 0,
     likes: { count: it.likes?.count || 0 },
     comments: {
       items: (it.comments?.items || []).map(c => ({
-        id: c.id, authorName: c.authorName, text: c.text,
-        createdAt: c.createdAt, updatedAt: c.updatedAt
+        id: c.id,
+        authorName: c.authorName,
+        text: c.text,
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt
       }))
     },
-    youLike: you ? !!(it.likes?.by?.[you.id] || it.likes?.by?.[you.email]) : undefined
+    youLike: you
+      ? !!(it.likes?.by?.[you.id] || it.likes?.by?.[you.email])
+      : undefined
   };
 }
 
 /* -------------------- STATUS ENGINE -------------- */
 function evalStatus(idea){
-  const m = idea.metrics ||= {};
+  const m   = idea.metrics ||= {};
   const dir = idea.direction || 'neutral';
-  const p = Number(m.last);
-  const el = Number(m.entry);
-  const sl = Number(m.stop);
+  const p   = Number(m.last);
+  const el  = Number(m.entry);
+  const sl  = Number(m.stop);
   const tgs = Array.isArray(m.targets) ? m.targets.map(Number) : [];
 
   let statusLight = 'gray';
   let statusNote  = 'No price/entry';
 
   if (!Number.isFinite(p) || !Number.isFinite(el)) {
-    m.statusLight = 'gray'; m.statusNote = statusNote; return m;
+    m.statusLight = 'gray';
+    m.statusNote  = statusNote;
+    return m;
   }
 
   const firstTarget = tgs.length ? tgs[0] : null;
 
   if (dir === 'long') {
-    if (Number.isFinite(sl) && p <= sl) { statusLight='red';  statusNote='Stop hit'; m.hitStop = true; }
-    else if (Number.isFinite(firstTarget) && p >= firstTarget) { statusLight='blue'; statusNote='Target reached'; if (m.hitTargetIndex == null) m.hitTargetIndex = 0; }
-    else if (p >= el) { statusLight='green'; statusNote='Above EL'; }
-    else { statusLight='orange'; statusNote='Below EL'; }
+    if (Number.isFinite(sl) && p <= sl) {
+      statusLight='red';  statusNote='Stop hit'; m.hitStop = true;
+    } else if (Number.isFinite(firstTarget) && p >= firstTarget) {
+      statusLight='blue'; statusNote='Target reached';
+      if (m.hitTargetIndex == null) m.hitTargetIndex = 0;
+    } else if (p >= el) {
+      statusLight='green'; statusNote='Above EL';
+    } else {
+      statusLight='orange'; statusNote='Below EL';
+    }
   } else if (dir === 'short') {
-    if (Number.isFinite(sl) && p >= sl) { statusLight='red';  statusNote='Stop hit'; m.hitStop = true; }
-    else if (Number.isFinite(firstTarget) && p <= firstTarget) { statusLight='blue'; statusNote='Target reached'; if (m.hitTargetIndex == null) m.hitTargetIndex = 0; }
-    else if (p <= el) { statusLight='green'; statusNote='Below EL'; }
-    else { statusLight='orange'; statusNote='Above EL'; }
+    if (Number.isFinite(sl) && p >= sl) {
+      statusLight='red';  statusNote='Stop hit'; m.hitStop = true;
+    } else if (Number.isFinite(firstTarget) && p <= firstTarget) {
+      statusLight='blue'; statusNote='Target reached';
+      if (m.hitTargetIndex == null) m.hitTargetIndex = 0;
+    } else if (p <= el) {
+      statusLight='green'; statusNote='Below EL';
+    } else {
+      statusLight='orange'; statusNote='Above EL';
+    }
   } else {
     statusLight='orange'; statusNote='Neutral';
   }
 
-  m.statusLight = statusLight; m.statusNote = statusNote;
+  m.statusLight = statusLight;
+  m.statusNote  = statusNote;
   return m;
 }
 
@@ -358,11 +457,13 @@ function evalStatus(idea){
 app.get('/ideas/latest', async (req, res) => {
   const limit = Math.min(Number(req.query.limit || 30), 100);
   const you   = readUser(req) || null;
+
   const db = await loadDB();
   const items = [...db.ideas]
     .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, limit)
     .map(it => ideaPublic(it, you));
+
   ok(res, { items, ideas: items });
 });
 
@@ -371,15 +472,22 @@ app.get('/ideas/:id', async (req, res) => {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
+
   ok(res, { item: ideaPublic(it, you) });
 });
 
 app.post('/ideas', requireUser, async (req, res) => {
   const db = await loadDB();
+
   const it = normalizeIdea(req.body || {}, req.user);
-  if (!it.imageUrl && Array.isArray(it.media) && it.media[0]?.url) it.imageUrl = it.media[0].url;
+
+  if (!it.imageUrl && Array.isArray(it.media) && it.media[0]?.url) {
+    it.imageUrl = it.media[0].url;
+  }
+
   db.ideas.unshift(it);
   await saveDB(db);
+
   const pub = ideaPublic(it, req.user);
   sseSend('idea:new', pub);
   ok(res, { item: pub });
@@ -389,6 +497,7 @@ app.patch('/ideas/:id', requireUser, async (req, res) => {
   const db = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
   if (idx < 0) return err(res, 404, 'Not found');
+
   const it = db.ideas[idx];
 
   // only author or admin
@@ -405,18 +514,24 @@ app.patch('/ideas/:id', requireUser, async (req, res) => {
     take:      req.body.take      ?? it.take,
     link:      req.body.link      ?? it.link,
     imageUrl:  (typeof req.body.imageUrl === 'string' ? req.body.imageUrl : it.imageUrl),
-    media: Array.isArray(req.body.media) ? req.body.media : it.media,
+    media:     Array.isArray(req.body.media) ? req.body.media : it.media,
     direction: normalizeDirection(req.body.direction ?? req.body.bias ?? it.direction),
     updatedAt: nowISO()
   });
 
   it.metrics ||= {};
-  if (req.body.entryLevel!=null || req.body.entry!=null || req.body.el!=null)
+
+  if (req.body.entryLevel!=null || req.body.entry!=null || req.body.el!=null) {
     it.metrics.entry = nnum(req.body.entryLevel ?? req.body.entry ?? req.body.el);
-  if (req.body.stopLevel!=null || req.body.stop!=null || req.body.sl!=null)
+  }
+  if (req.body.stopLevel!=null || req.body.stop!=null || req.body.sl!=null) {
     it.metrics.stop = nnum(req.body.stopLevel ?? req.body.stop ?? req.body.sl);
-  if (req.body.targets!=null || req.body.targetText!=null || req.body.tp!=null || req.body.tps!=null)
-    it.metrics.targets = parseTargets(req.body.targets ?? req.body.targetText ?? req.body.tp ?? req.body.tps);
+  }
+  if (req.body.targets!=null || req.body.targetText!=null || req.body.tp!=null || req.body.tps!=null) {
+    it.metrics.targets = parseTargets(
+      req.body.targets ?? req.body.targetText ?? req.body.tp ?? req.body.tps
+    );
+  }
 
   evalStatus(it);
 
@@ -430,13 +545,17 @@ app.delete('/ideas/:id', requireUser, async (req, res) => {
   const db = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
   if (idx < 0) return err(res, 404, 'Not found');
+
   const it = db.ideas[idx];
+
   if (!(req.user.role === 'admin' || it.authorId === req.user.id)) {
     return err(res, 403, 'Forbidden');
   }
+
   const id = it.id;
   db.ideas.splice(idx, 1);
   await saveDB(db);
+
   sseSend('idea:delete', { id });
   ok(res, { ok: true });
 });
@@ -444,7 +563,9 @@ app.delete('/ideas/:id', requireUser, async (req, res) => {
 /* ---------------------- LIKES --------------------- */
 async function likeHandler(req, res) {
   const action = String(req.body?.action || req.body?.op || '').toLowerCase();
-  if (!['like', 'unlike'].includes(action)) return err(res, 400, 'Invalid action');
+  if (!['like', 'unlike'].includes(action)) {
+    return err(res, 400, 'Invalid action');
+  }
 
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
@@ -455,6 +576,7 @@ async function likeHandler(req, res) {
 
   it.likes ||= { count: 0, by: {} };
   it.likes.by ||= {};
+
   const was = !!(it.likes.by[userId] || it.likes.by[req.user?.email]);
 
   if (action === 'like' && !was) {
@@ -462,18 +584,30 @@ async function likeHandler(req, res) {
   } else if (action === 'unlike' && was) {
     delete it.likes.by[userId];
   }
-  // recount
+
   it.likes.count = Object.keys(it.likes.by).length;
 
   await saveDB(db);
-  const out = { id: it.id, likeCount: it.likes.count, youLike: action === 'like' };
+
+  const out = {
+    id: it.id,
+    likeCount: it.likes.count,
+    youLike: action === 'like'
+  };
+
   sseSend('likes:update', out);
-  ok(res, { likeCount: it.likes.count, likes: { count: it.likes.count }, youLike: out.youLike });
+
+  ok(res, {
+    likeCount: it.likes.count,
+    likes: { count: it.likes.count },
+    youLike: out.youLike
+  });
 }
-app.put('/ideas/:id/likes', requireUser, likeHandler);
-app.post('/ideas/:id/likes', requireUser, likeHandler);
+
+app.put('/ideas/:id/likes',        requireUser, likeHandler);
+app.post('/ideas/:id/likes',       requireUser, likeHandler);
 app.put('/ideas/:id/likes/toggle', requireUser, likeHandler);
-app.post('/ideas/:id/likes/toggle', requireUser, likeHandler);
+app.post('/ideas/:id/likes/toggle',requireUser, likeHandler);
 
 /* -------------------- COMMENTS -------------------- */
 async function _commentAdd(req, res) {
@@ -486,26 +620,38 @@ async function _commentAdd(req, res) {
 
   const c = {
     id: uid(10),
-    authorId: String(req.user?.id || ''),
-    authorName: String(req.user?.name || 'Member'),
+    authorId:    String(req.user?.id || ''),
+    authorName:  String(req.user?.name || 'Member'),
     authorEmail: String(req.user?.email || ''),
-    text, createdAt: nowISO(), updatedAt: nowISO()
+    text,
+    createdAt: nowISO(),
+    updatedAt: nowISO()
   };
+
   it.comments ||= { items: [] };
   it.comments.items.push(c);
 
   await saveDB(db);
+
   const items = it.comments.items.map(x => ({
-    id: x.id, authorName: x.authorName, text: x.text, createdAt: x.createdAt, updatedAt: x.updatedAt
+    id: x.id,
+    authorName: x.authorName,
+    text: x.text,
+    createdAt: x.createdAt,
+    updatedAt: x.updatedAt
   }));
+
   sseSend('comments:update', { id: it.id, items });
   ok(res, { items });
 }
+
 async function _commentEdit(req, res) {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
-  const c = (it.comments?.items || []).find(x => String(x.id) === String(req.params.cid));
+
+  const c = (it.comments?.items || [])
+    .find(x => String(x.id) === String(req.params.cid));
   if (!c) return err(res, 404, 'comment not found');
 
   // only comment author or admin
@@ -515,63 +661,88 @@ async function _commentEdit(req, res) {
 
   const text = String(req.body?.text || '').trim();
   if (!text) return err(res, 400, 'text required');
+
   c.text = text;
   c.updatedAt = nowISO();
 
   await saveDB(db);
+
   const items = it.comments.items.map(x => ({
-    id: x.id, authorName: x.authorName, text: x.text, createdAt: x.createdAt, updatedAt: x.updatedAt
+    id: x.id,
+    authorName: x.authorName,
+    text: x.text,
+    createdAt: x.createdAt,
+    updatedAt: x.updatedAt
   }));
+
   sseSend('comments:update', { id: it.id, items });
   ok(res, { items });
 }
+
 async function _commentDelete(req, res) {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
-  const items = it.comments?.items || [];
-  const idx = items.findIndex(x => String(x.id) === String(req.params.cid));
+  const arr = it.comments?.items || [];
+  const idx = arr.findIndex(x => String(x.id) === String(req.params.cid));
   if (idx < 0) return err(res, 404, 'comment not found');
 
-  const c = items[idx];
+  const c = arr[idx];
   if (!(req.user.role === 'admin' || c.authorId === req.user.id)) {
     return err(res, 403, 'Forbidden');
   }
 
-  items.splice(idx, 1);
+  arr.splice(idx, 1);
   await saveDB(db);
-  const out = it.comments.items.map(x => ({
-    id: x.id, authorName: x.authorName, text: x.text, createdAt: x.createdAt, updatedAt: x.updatedAt
+
+  const items = it.comments.items.map(x => ({
+    id: x.id,
+    authorName: x.authorName,
+    text: x.text,
+    createdAt: x.createdAt,
+    updatedAt: x.updatedAt
   }));
-  sseSend('comments:update', { id: it.id, items: out });
-  ok(res, { items: out });
+
+  sseSend('comments:update', { id: it.id, items });
+  ok(res, { items });
 }
-app.post('/ideas/:id/comments', requireUser, _commentAdd);
-app.patch('/ideas/:id/comments/:cid', requireUser, _commentEdit);
-app.delete('/ideas/:id/comments/:cid', requireUser, _commentDelete);
+
+app.post('/ideas/:id/comments',           requireUser, _commentAdd);
+app.patch('/ideas/:id/comments/:cid',     requireUser, _commentEdit);
+app.delete('/ideas/:id/comments/:cid',    requireUser, _commentDelete);
 
 /* --------------------- EMAIL CORE ----------------- */
 function smtpReady() {
   return !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true));
 }
+
 let transporter = null;
+
 function getTransporter() {
   if (!smtpReady()) return null;
   if (transporter) return transporter;
+
   transporter = nodemailer.createTransport({
-    host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE,
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
     auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-    connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 15000
   });
+
   return transporter;
 }
+
 function fromHeader() {
   if (EMAIL_FROM_INLINE) return EMAIL_FROM_INLINE;
-  if (MAIL_FROM) return `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`;
-  if (SMTP_USER) return `"${MAIL_FROM_NAME}" <${SMTP_USER}>`;
+  if (MAIL_FROM)        return `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`;
+  if (SMTP_USER)        return `"${MAIL_FROM_NAME}" <${SMTP_USER}>`;
   return `"${MAIL_FROM_NAME}" <no-reply@localhost>`;
 }
+
 function splitEmails(list) {
   return String(list || '')
     .split(/[,\s;]+/)
@@ -579,43 +750,63 @@ function splitEmails(list) {
     .filter(Boolean)
     .filter(e => EMAIL_RX.test(e));
 }
+
 function packToBcc(all) {
-  const uniqd = uniq(all);
-  if (uniqd.length <= 1) return { to: uniqd[0] || undefined, bcc: undefined };
-  return { to: uniqd[0], bcc: uniqd.slice(1) };
+  const u = uniq(all);
+  if (u.length <= 1) return { to: u[0] || undefined, bcc: undefined };
+  return { to: u[0], bcc: u.slice(1) };
 }
+
 function _esc(s) {
   return String(s || '')
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
+
 function _bullets(s) {
   const parts = String(s || '')
     .split(/\r?\n|[;•]\s*/g)
     .map(x => x.trim())
     .filter(Boolean);
+
   if (!parts.length) return '';
   return `<ul style="margin:8px 0 0 20px;padding:0">
     ${parts.map(li => `<li style="margin:6px 0;line-height:1.45">${_esc(li)}</li>`).join('')}
   </ul>`;
 }
-function _emailShell({ preheader, title, symbol, levelsHTML, planHTML, imgUrl, ctaHref, ctaText, badgeText, theme, statusColor }) {
+
+function _emailShell({
+  preheader,
+  title,
+  symbol,
+  levelsHTML,
+  planHTML,
+  imgUrl,
+  ctaHref,
+  ctaText,
+  badgeText,
+  theme,
+  statusColor
+}) {
   const isClear = ['clear','transparent','none','minimal','white'].includes(theme);
-  const logo = absUrl(LOGO_URL);
-  const brand = MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
-  const hasImg = !!imgUrl;
+  const logo    = absUrl(LOGO_URL);
+  const brand   = MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
+  const hasImg  = !!imgUrl;
 
   const bodyBg     = isClear ? '' : 'background:#0a0f1a;';
   const container  = isClear
     ? 'background:transparent;border:none;box-shadow:none;'
     : 'background:#0b1220;border:1px solid rgba(255,255,255,0.06);box-shadow:0 6px 28px rgba(0,0,0,0.35);';
-  const headGrad   = isClear ? '' : 'background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0));';
   const textColor  = isClear ? '#0b1220' : '#e8eefc';
   const titleColor = isClear ? '#0b1220' : '#f5f8ff';
   const badgeBg    = isClear ? 'rgba(0,0,0,0.05)' : 'rgba(255,255,255,0.06)';
   const badgeColor = isClear ? '#0b1220' : '#dce6ff';
 
-  const dot = statusColor ? `<span style="display:inline-block;width:10px;height:10px;border-radius:999px;margin-right:8px;vertical-align:middle;background:${statusColor}"></span>` : '';
+  const dot = statusColor
+    ? `<span style="display:inline-block;width:10px;height:10px;border-radius:999px;margin-right:8px;vertical-align:middle;background:${statusColor}"></span>`
+    : '';
 
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -662,9 +853,13 @@ function _emailShell({ preheader, title, symbol, levelsHTML, planHTML, imgUrl, c
 
         <tr><td align="left" style="padding:8px 20px 24px 20px">
           <table role="presentation" cellpadding="0" cellspacing="0"><tr>
-            <td><a href="${_esc(ideaDeepLink({ id:'', symbol:'', title:title }))}" style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;text-decoration:none;border-radius:999px;font-weight:900;font-size:14px" target="_blank" rel="noopener">${_esc(ctaText || 'Open on Dashboard')}</a></td>
+            <td><a href="${_esc(ideaDeepLink({ id:'', symbol:'', title:title }))}"
+                   style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;text-decoration:none;border-radius:999px;font-weight:900;font-size:14px"
+                   target="_blank" rel="noopener">${_esc(ctaText || 'Open on Dashboard')}</a></td>
             <td width="12"></td>
-            <td><a href="${_esc(SITE_URL)}" style="display:inline-block;padding:12px 16px;background:transparent;color:#cfe8ff;text-decoration:none;border-radius:999px;font-weight:700;font-size:14px;border:1px solid rgba(255,255,255,0.14)" target="_blank" rel="noopener">Visit Site</a></td>
+            <td><a href="${_esc(SITE_URL)}"
+                   style="display:inline-block;padding:12px 16px;background:transparent;color:#cfe8ff;text-decoration:none;border-radius:999px;font-weight:700;font-size:14px;border:1px solid rgba(255,255,255,0.14)"
+                   target="_blank" rel="noopener">Visit Site</a></td>
           </tr></table>
         </td></tr>
 
@@ -676,58 +871,74 @@ function _emailShell({ preheader, title, symbol, levelsHTML, planHTML, imgUrl, c
   </table>
 </body></html>`;
 }
+
 function emailTemplatePost(item) {
   const title   = item?.title || 'New Idea';
   const symbol  = item?.symbol || '';
   const levels  = _bullets(item?.levelText || item?.levels || '');
   const plan    = _bullets(item?.take || item?.content || '');
   const imgUrl  = firstImageUrl(item);
-  const deepURL = ideaDeepLink(item);
+  const deepURL = ideaDeepLink(item); // may be used later if you want CTA direct to this idea
   const pre     = `${symbol ? symbol + ' • ' : ''}${title}`;
+
   return _emailShell({
     preheader: `New Idea — ${pre}`,
-    title, symbol, levelsHTML: levels, planHTML: plan,
-    imgUrl, ctaText: 'Open on Dashboard',
-    badgeText: '🔔 New Idea', theme: EMAIL_THEME
+    title,
+    symbol,
+    levelsHTML: levels,
+    planHTML: plan,
+    imgUrl,
+    ctaHref: deepURL,
+    ctaText: 'Open on Dashboard',
+    badgeText: '🔔 New Idea',
+    theme: EMAIL_THEME
   });
 }
 
-/* ---------------------- EMAIL ROUTES ------------- */
-// (unchanged behavior)
-function smtpReady(){ return !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true)); }
-let transporter=null;
-function getTransporter(){
-  if (!smtpReady()) return null;
-  if (transporter) return transporter;
-  transporter = nodemailer.createTransport({
-    host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE,
-    auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-    connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000
-  });
-  return transporter;
-}
-function fromHeader(){
-  if (EMAIL_FROM_INLINE) return EMAIL_FROM_INLINE;
-  if (MAIL_FROM) return `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`;
-  if (SMTP_USER) return `"${MAIL_FROM_NAME}" <${SMTP_USER}>`;
-  return `"${MAIL_FROM_NAME}" <no-reply@localhost>`;
-}
-function splitEmails(list){ return String(list||'').split(/[,\s;]+/).map(s=>s.trim().toLowerCase()).filter(Boolean).filter(e=>EMAIL_RX.test(e)); }
-function packToBcc(all){ const u=uniq(all); if(u.length<=1) return {to:u[0]||undefined,bcc:undefined}; return {to:u[0], bcc:u.slice(1)}; }
-
+/* ---------------- EMAIL SEND HELPERS ------------- */
 async function recipientsFor(reqBody){
+  // force override list from env
   const forced = splitEmails(EMAIL_FORCE_ALL_TO);
   if (forced.length) return { list: forced, mode:'forced' };
-  const subs = await (async()=>{ try{ const raw=await fsp.readFile(SUBS_FILE,'utf8').catch(()=> ''); if(!raw) return {subs:[]}; const j=JSON.parse(raw); return j||{subs:[]}; } catch { return {subs:[]}; }})();
-  const list = uniq((subs.subs||[]).map(s=>String(s.email||'').toLowerCase()).filter(e=>EMAIL_RX.test(e)));
+
+  // subscribers file
+  const subs = await (async ()=>{
+    try {
+      const raw = await fsp.readFile(SUBS_FILE,'utf8').catch(()=> '');
+      if (!raw) return { subs:[] };
+      const j = JSON.parse(raw);
+      return j || { subs:[] };
+    } catch {
+      return { subs:[] };
+    }
+  })();
+
+  const list = uniq(
+    (subs.subs||[])
+      .map(s => String(s.email||'').toLowerCase())
+      .filter(e => EMAIL_RX.test(e))
+  );
+
   if (list.length) return { list, mode:'subs' };
-  const actorEmail = String(reqBody?.actor?.email || reqBody?.actorEmail || '').trim().toLowerCase();
-  if (EMAIL_RX.test(actorEmail)) return { list:[actorEmail], mode:'actor' };
+
+  // fallback: actor email
+  const actorEmail = String(reqBody?.actor?.email || reqBody?.actorEmail || '')
+    .trim()
+    .toLowerCase();
+  if (EMAIL_RX.test(actorEmail)) {
+    return { list:[actorEmail], mode:'actor' };
+  }
+
+  // last fallback: admins
   const admins = (EMAIL_BCC_ADMIN || []).filter(e => EMAIL_RX.test(e));
-  return admins.length ? { list: admins, mode:'admin' } : { list: [], mode:'none' };
+  return admins.length
+    ? { list: admins, mode:'admin' }
+    : { list: [], mode:'none' };
 }
+
 async function sendEmailBlast({ subject, html, toList }){
-  try{
+  // 1) Try SMTP (nodemailer)
+  try {
     const tx = getTransporter();
     if (tx && toList.length){
       const from    = fromHeader();
@@ -735,12 +946,27 @@ async function sendEmailBlast({ subject, html, toList }){
       const adminBcc = EMAIL_BCC_ADMIN;
       const { to, bcc } = packToBcc(toList);
       const finalBcc = uniq([...(bcc || []), ...adminBcc]);
-      const info = await tx.sendMail({ from, to: to || undefined, bcc: finalBcc.length ? finalBcc : undefined, subject, html, replyTo });
-      return { sent: toList.length, messageId: info?.messageId || '', via:'smtp' };
+
+      const info = await tx.sendMail({
+        from,
+        to: to || undefined,
+        bcc: finalBcc.length ? finalBcc : undefined,
+        subject,
+        html,
+        replyTo
+      });
+
+      return {
+        sent: toList.length,
+        messageId: info?.messageId || '',
+        via:'smtp'
+      };
     }
-  }catch(e){
+  } catch(e){
     console.warn('[email][smtp] failed, trying HTTP fallback:', e?.message || e);
   }
+
+  // 2) Fallback: Mailjet-style HTTP call using SMTP_USER/SMTP_PASS
   if (!(SMTP_USER && SMTP_PASS)) throw new Error('No SMTP creds for HTTP fallback');
   if (!toList.length) return { sent:0, via:'http' };
 
@@ -753,66 +979,129 @@ async function sendEmailBlast({ subject, html, toList }){
       Headers: EMAIL_REPLY_TO ? { 'Reply-To': EMAIL_REPLY_TO } : undefined
     }]
   };
+
   const auth = Buffer.from(`${SMTP_USER}:${SMTP_PASS}`).toString('base64');
   const body = JSON.stringify(payload);
 
   const httpResult = await new Promise((resolve, reject)=>{
     const req = https.request({
-      method: 'POST', host: 'api.mailjet.com', path: '/v3.1/send',
-      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      method: 'POST',
+      host: 'api.mailjet.com',
+      path: '/v3.1/send',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      },
       timeout: 12000
     }, res=>{
-      let data=''; res.on('data', c=> data+=c);
-      res.on('end', ()=> res.statusCode >= 200 && res.statusCode < 300
-        ? resolve({ ok:true, status: res.statusCode, body: data })
-        : reject(new Error(`Mailjet HTTP ${res.statusCode} ${data.slice(0,200)}`)));
+      let data='';
+      res.on('data', c => data+=c);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ ok:true, status: res.statusCode, body: data });
+        } else {
+          reject(new Error(`Mailjet HTTP ${res.statusCode} ${data.slice(0,200)}`));
+        }
+      });
     });
     req.on('timeout', ()=>{ req.destroy(new Error('Mailjet HTTP timeout')); });
-    req.on('error', reject); req.write(body); req.end();
+    req.on('error', reject);
+    req.write(body);
+    req.end();
   });
+
   return { sent: toList.length, via: 'http', raw: httpResult.status };
 }
 
+/* ---------------------- EMAIL ROUTE -------------- */
 app.post('/email/post', requireAdmin, async (req, res) => {
   try{
     const item = req.body?.item || req.body?.data || null;
     if (!item) return err(res, 400, 'item required');
+
     const { list, mode } = await recipientsFor(req.body || {});
-    if (!list.length) return ok(res, { ok:true, sent:0, info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)' });
-    const subject = `🔔 New Idea: ${item.symbol ? `${item.symbol} — `:''}${item.title||'Update'}`;
+    if (!list.length) {
+      return ok(res, {
+        ok:true,
+        sent:0,
+        info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)'
+      });
+    }
+
+    const subject = `🔔 New Idea: ${
+      item.symbol ? `${item.symbol} — ` : ''
+    }${item.title||'Update'}`;
+
     const html = emailTemplatePost(item);
+
     const result = await sendEmailBlast({ subject, html, toList:list });
-    ok(res, { ok:true, sent: result.sent, mode, via: result.via });
-  }catch(e){ err(res, 500, e.message || 'Email failed'); }
+
+    ok(res, {
+      ok:true,
+      sent: result.sent,
+      mode,
+      via: result.via
+    });
+  } catch(e){
+    err(res, 500, e.message || 'Email failed');
+  }
 });
 
 /* ---------------------- PRICE PING ---------------- */
-app.post('/price/ping', requireAdmin, async (req, res) => {
-  // same logic as before — left out for brevity in this block
-  // you can keep your previous working /price/ping body here.
-  ok(res, { ok:true }); // (optional stub if you’re not using it)
+app.post('/price/ping', requireAdmin, async (_req, res) => {
+  // stub / keep your old live price update logic here if you had it
+  ok(res, { ok:true });
 });
 
-/* ----------------------- SUBSCRIBERS -------------- */
+/* ----------------------- SUBSCRIBE --------------- */
 app.post('/subscribe', requireUser, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const name  = String(req.body?.name || req.user?.name || 'Member').trim();
-  if (!email || !EMAIL_RX.test(email)) return err(res, 400, 'Valid email required');
-  const s = await (async()=>{ try{ const raw=await fsp.readFile(SUBS_FILE,'utf8').catch(()=> ''); return raw?JSON.parse(raw):{subs:[]}; } catch { return {subs:[]}; }})();
-  const exists = (s.subs || []).find(x => x.email === email);
-  if (!exists) (s.subs ||= []).push({ email, name, createdAt: nowISO(), status: 'active' });
-  await ensureDir(DATA_DIR); await fsp.writeFile(SUBS_FILE, JSON.stringify(s,null,2),'utf8');
+
+  if (!email || !EMAIL_RX.test(email)) {
+    return err(res, 400, 'Valid email required');
+  }
+
+  const subs = await (async()=>{
+    try {
+      const raw = await fsp.readFile(SUBS_FILE,'utf8').catch(()=> '');
+      return raw ? JSON.parse(raw) : { subs:[] };
+    } catch {
+      return { subs:[] };
+    }
+  })();
+
+  const exists = (subs.subs || []).find(x => x.email === email);
+  if (!exists) {
+    (subs.subs ||= []).push({
+      email,
+      name,
+      createdAt: nowISO(),
+      status: 'active'
+    });
+  }
+
+  await ensureDir(DATA_DIR);
+  await fsp.writeFile(SUBS_FILE, JSON.stringify(subs,null,2),'utf8');
+
   ok(res, { ok:true });
 });
 
 /* ----------------------- UPLOAD ------------------- */
 let upload;
+
 function buildMulter() {
   upload = multer({
     storage: multer.diskStorage({
       destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
       filename: (_req, file, cb) => {
-        const ext = ({ 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif' }[file.mimetype]) || '';
+        const ext = ({
+          'image/png' : '.png',
+          'image/jpeg': '.jpg',
+          'image/webp': '.webp',
+          'image/gif' : '.gif'
+        }[file.mimetype]) || '';
         cb(null, `${Date.now()}_${uid(8)}${ext}`);
       }
     }),
@@ -823,12 +1112,16 @@ function buildMulter() {
     limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 }
   });
 }
+
 app.post('/upload', requireUser, (req, res) => {
   if (!upload) return err(res, 500, 'Upload not initialized');
+
   upload.single('file')(req, res, e => {
     if (e) return err(res, 400, e.message || 'Upload failed');
+
     const file = req.file;
     if (!file) return err(res, 400, 'No file');
+
     ok(res, { url: `/uploads/${file.filename}` });
   });
 });
@@ -838,10 +1131,12 @@ async function start() {
   await ensureDir(DATA_DIR);
   await ensureDir(UPLOAD_DIR);
   buildMulter();
+
   app.listen(PORT, () => {
-    console.log(`Email: /email/post  Debug: /debug/email/status (removed)`);
+    console.log(`Email: /email/post`);
     console.log(`[tcpp-ideas-backend] listening on :${PORT} env=${NODE_ENV} data=${DATA_FILE}`);
     console.log(`SSE: /events  CRUD: /ideas  Latest: /ideas/latest  Upload: /upload`);
   });
 }
+
 start();
