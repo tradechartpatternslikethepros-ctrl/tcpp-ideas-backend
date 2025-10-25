@@ -1,6 +1,12 @@
 /* server.cjs
  * TCPP Ideas Backend — ideas + uploads + likes + comments
  * + live status engine (EL/SL/TPs) + stop/target email triggers
+ *
+ * This version:
+ * - stays CommonJS (works with "type": "commonjs")
+ * - dynamic CORS allowlist (Wix, localhost, *.filesusr.com, *.wixsite.com, etc.)
+ * - referer allowlist for /price/ping using ALLOW_FETCH_REFERERS env
+ * - SSE live updates for dashboard
  */
 
 'use strict';
@@ -37,6 +43,14 @@ const ALLOWED_UPLOAD_TYPES = (process.env.ALLOWED_UPLOAD_TYPES
 
 const PRICE_STALE_SEC = Number(process.env.PRICE_STALE_SEC || 900);
 
+/* allowlist for /price/ping source (TradingView etc)
+   comma-separated list like: "tradingview.com,*.tradingview.com"
+*/
+const ALLOW_FETCH_REFERERS = (process.env.ALLOW_FETCH_REFERERS || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
 /* ---------------------- EMAIL -------------------- */
 const SMTP_HOST   = process.env.SMTP_HOST   || '';
 const SMTP_PORT   = Number(process.env.SMTP_PORT || 587);
@@ -46,10 +60,12 @@ const SMTP_PASS   = process.env.SMTP_PASS   || '';
 
 const MAIL_FROM         = process.env.MAIL_FROM || '';
 const MAIL_FROM_NAME    = process.env.MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
-const EMAIL_FROM_INLINE = process.env.EMAIL_FROM || '';
+const EMAIL_FROM        = process.env.EMAIL_FROM || ''; // inline "Name <email>"
 const EMAIL_REPLY_TO    = (process.env.EMAIL_REPLY_TO || '').trim();
+
 const EMAIL_BCC_ADMIN   = (process.env.EMAIL_BCC_ADMIN || '')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
 const EMAIL_FORCE_ALL_TO = (process.env.EMAIL_FORCE_ALL_TO || '').trim().toLowerCase();
 
 const SITE_NAME   = process.env.SITE_NAME   || 'Trade Chart Patterns — Pro';
@@ -61,13 +77,22 @@ const LOGO_URL    = process.env.EMAIL_LOGO_URL
 const ASSET_BASE_URL = process.env.ASSET_BASE_URL || SITE_URL;
 const EMAIL_THEME    = (process.env.EMAIL_THEME || 'dark').toLowerCase();
 const EMAIL_LAYOUT   = (process.env.EMAIL_LAYOUT || 'hero-first').toLowerCase();
-const EMAIL_BODY_BG  = (process.env.EMAIL_BODY_BG || '');
+const EMAIL_BODY_BG  = process.env.EMAIL_BODY_BG || '';
 
 /* ---------------------- UTIL ---------------------- */
 const nowISO = () => new Date().toISOString();
-async function ensureDir(p) { await fsp.mkdir(p, { recursive: true }).catch(() => {}); }
-function ok(res, data) { res.json(data); }
-function err(res, code, msg) { res.status(code).json({ status:'error', code, message: msg || 'Error' }); }
+
+async function ensureDir(p) {
+  await fsp.mkdir(p, { recursive: true }).catch(() => {});
+}
+
+function ok(res, data) {
+  res.json(data);
+}
+function err(res, code, msg) {
+  res.status(code).json({ status:'error', code, message: msg || 'Error' });
+}
+
 function absUrl(u) {
   const s = String(u || '').trim();
   if (!s) return '';
@@ -75,6 +100,7 @@ function absUrl(u) {
   const base = (UPLOADS_PUBLIC_BASE_URL || ASSET_BASE_URL || SITE_URL || '').replace(/\/+$/,'');
   return base + (s.startsWith('/') ? s : `/${s}`);
 }
+
 const EMAIL_RX = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const uniq = a => Array.from(new Set(a || []));
 
@@ -133,7 +159,12 @@ function buildMulter() {
     storage: multer.diskStorage({
       destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
       filename: (_req, file, cb) => {
-        const ext = ({ 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif' }[file.mimetype]) || '';
+        const ext = ({
+          'image/png': '.png',
+          'image/jpeg': '.jpg',
+          'image/webp': '.webp',
+          'image/gif': '.gif'
+        }[file.mimetype]) || '';
         cb(null, `${Date.now()}_${nanoid(8)}${ext}`);
       }
     }),
@@ -155,7 +186,7 @@ function readQueryToken(req) {
   return (req.query && String(req.query.token || '').trim()) || '';
 }
 function requireAuth(req, res, next) {
-  if (!API_TOKEN) return next();
+  if (!API_TOKEN) return next(); // if no token set, open (dev mode)
   const tok = readBearer(req) || readQueryToken(req);
   if (tok !== API_TOKEN) return err(res, 401, 'Unauthorized');
   next();
@@ -166,11 +197,58 @@ function sseAuthOK(req) {
   return tok === API_TOKEN;
 }
 
+/* ----------------- REFERER GUARD ------------------
+   Used ONLY for /price/ping so TradingView etc can hit it,
+   and random strangers can't spam it.
+
+   ALLOW_FETCH_REFERERS can have plain hosts ("tradingview.com")
+   or wildcard ("*.tradingview.com").
+---------------------------------------------------*/
+function wildcardToRegex(pattern) {
+  // escape regex chars, then turn "*" into ".*"
+  let esc = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+  esc = esc.replace(/\\\*/g, '.*');
+  return new RegExp('^' + esc + '$', 'i');
+}
+
+const ALLOWED_REF_REGEXES = ALLOW_FETCH_REFERERS.map(p => {
+  try { return wildcardToRegex(p); } catch { return null; }
+}).filter(Boolean);
+
+function getRefHost(req) {
+  const ref = String(req.headers['referer'] || req.headers['origin'] || '').trim();
+  if (!ref) return '';
+  try {
+    const u = new URL(ref);
+    return u.hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function checkReferer(req, res, next) {
+  if (!ALLOWED_REF_REGEXES.length) {
+    // nothing configured -> allow everyone
+    return next();
+  }
+  const host = getRefHost(req);
+  if (!host) {
+    return err(res, 403, 'Forbidden (no referer)');
+  }
+  const pass = ALLOWED_REF_REGEXES.some(rx => rx.test(host));
+  if (!pass) {
+    return err(res, 403, 'Forbidden referer');
+  }
+  next();
+}
+
 /* ----------------------- SSE ---------------------- */
 const clients = new Set(); // { id, res, ping }
 function sseSend(event, data) {
   const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const c of clients) { try { c.res.write(line); } catch {} }
+  for (const c of clients) {
+    try { c.res.write(line); } catch { /* ignore */ }
+  }
 }
 function sseSendTo(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -179,40 +257,74 @@ function sseSendTo(res, event, data) {
 /* ----------------------- APP --------------------- */
 const app = express();
 
-// CORS whitelist logic (Wix editor, *.wixsite.com, *.filesusr.com, localhost, your prod domains)
+/* ----- CORS allow logic ----- */
 function isOriginAllowed(origin) {
-  if (!origin) return true;
+  if (!origin) return true; // no Origin header (curl, server->server) -> allow
+
   if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return true;
+
   try {
     const { protocol, host } = new URL(origin);
-    if (host.endsWith('.wixsite.com')) return protocol === 'https:';
-    if (host.endsWith('.filesusr.com')) return protocol === 'https:';
+
+    // wix editor/preview
+    if (host.endsWith('.wixsite.com')) {
+      return protocol === 'https:';
+    }
+
+    // Wix media files / filesusr.com
+    if (host.endsWith('.filesusr.com')) {
+      return protocol === 'https:';
+    }
+
+    // wildcard entries like https://*.wixsite.com
     for (const pat of CORS_ORIGINS) {
       if (!pat.includes('*')) continue;
       const m = pat.match(/^https?:\/\/\*\.(.+)$/i);
-      if (m && host.endsWith(m[1])) return protocol === 'https:';
+      if (m && host.endsWith(m[1])) {
+        return protocol === 'https:';
+      }
     }
+
+    // localhost dev
     if (/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host)) return true;
-  } catch {}
+  } catch {
+    // bad Origin header -> block
+    return false;
+  }
   return false;
 }
 
+/* CORS middleware */
 app.use(cors({
-  origin: (origin, cb) => cb(null, isOriginAllowed(origin)),
+  origin: (origin, cb) => {
+    const allowed = isOriginAllowed(origin);
+    if (!allowed) {
+      console.error(`CORS blocked: ${origin}`);
+    }
+    cb(null, allowed);
+  },
   credentials: false
 }));
 
+/* body parsing */
 app.use(express.json({ limit: '1mb' }));
 
-// serve uploaded images
+/* static uploads */
 app.use('/uploads', express.static(UPLOAD_DIR, {
   index: false,
   maxAge: '30d',
-  setHeaders: res => res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
+  setHeaders: res => {
+    // so images can be embedded on wix site etc
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  }
 }));
 
 /* ---------------------- HEALTH ------------------- */
-app.get('/health', (_req, res) => ok(res, { ok: true, env: NODE_ENV, time: nowISO() }));
+app.get('/health', (_req, res) => ok(res, {
+  ok: true,
+  env: NODE_ENV,
+  time: nowISO()
+}));
 
 /* ---------------------- EVENTS (SSE) ------------- */
 app.get('/events', (req, res) => {
@@ -224,7 +336,8 @@ app.get('/events', (req, res) => {
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no'
   });
-  res.flushHeaders?.();
+
+  if (res.flushHeaders) res.flushHeaders();
 
   const id = nanoid(10);
   const client = { id, res, ping: null };
@@ -245,20 +358,23 @@ app.get('/events', (req, res) => {
 /* -------------------- NORMALIZATION -------------- */
 function normalizeDirection(v) {
   const s = String(v || '').toLowerCase();
-  if (s === 'long' || s === 'buy') return 'long';
+  if (s === 'long'  || s === 'buy')  return 'long';
   if (s === 'short' || s === 'sell') return 'short';
   return 'neutral';
 }
+
 function firstImageUrl(item) {
   const raw = item?.imageUrl ||
     (Array.isArray(item?.media) && item.media[0] && item.media[0].url) || '';
   return absUrl(raw);
 }
+
 function ideaDeepLink(item) {
   const base = `${SITE_URL}/trading-dashboard`;
   const id   = String(item?.id || '').trim();
   if (!id) return base;
-  const q    = `?idea=${encodeURIComponent(id)}&utm_source=email&utm_medium=notification&utm_campaign=${encodeURIComponent(item?.symbol ? 'idea-'+item.symbol : 'idea')}`;
+  const campaign = item?.symbol ? `idea-${item.symbol}` : 'idea';
+  const q = `?idea=${encodeURIComponent(id)}&utm_source=email&utm_medium=notification&utm_campaign=${encodeURIComponent(campaign)}`;
   return `${base}${q}`;
 }
 
@@ -279,9 +395,9 @@ function normalizeIdea(input) {
     take: String(input.take || input.content || '').slice(0, 4000),
     link: String(input.link || '').slice(0, 1024),
     imageUrl: String(input.imageUrl || input.img || ''),
-    media: Array.isArray(input.media) ? input.media.map(m => ({
-      kind: String(m.kind || 'image'), url: String(m.url || '')
-    })) : [],
+    media: Array.isArray(input.media)
+      ? input.media.map(m => ({ kind: String(m.kind || 'image'), url: String(m.url || '') }))
+      : [],
     direction: dir,
     metrics: {
       entry: entry ?? null,
@@ -304,12 +420,19 @@ function normalizeIdea(input) {
     updatedAt: now
   };
 }
+
 function ideaPublic(it) {
   return {
-    id: it.id, type: it.type, status: it.status,
-    title: it.title, symbol: it.symbol,
-    levelText: it.levelText, take: it.take,
-    link: it.link, imageUrl: it.imageUrl, media: it.media,
+    id: it.id,
+    type: it.type,
+    status: it.status,
+    title: it.title,
+    symbol: it.symbol,
+    levelText: it.levelText,
+    take: it.take,
+    link: it.link,
+    imageUrl: it.imageUrl,
+    media: it.media,
     direction: it.direction || 'neutral',
     metrics: it.metrics ? {
       entry: it.metrics.entry ?? null,
@@ -320,16 +443,23 @@ function ideaPublic(it) {
       statusLight: it.metrics.statusLight || 'gray',
       statusNote: it.metrics.statusNote || '',
       hitStop: !!it.metrics.hitStop,
-      hitTargetIndex: Number.isFinite(it.metrics.hitTargetIndex) ? it.metrics.hitTargetIndex : null
+      hitTargetIndex: Number.isFinite(it.metrics.hitTargetIndex)
+        ? it.metrics.hitTargetIndex
+        : null
     } : undefined,
-    authorName: it.authorName, authorEmail: it.authorEmail,
-    createdAt: it.createdAt, updatedAt: it.updatedAt,
+    authorName: it.authorName,
+    authorEmail: it.authorEmail,
+    createdAt: it.createdAt,
+    updatedAt: it.updatedAt,
     likeCount: it.likes?.count || 0,
     likes: { count: it.likes?.count || 0 },
     comments: {
       items: (it.comments?.items || []).map(c => ({
-        id: c.id, authorName: c.authorName, text: c.text,
-        createdAt: c.createdAt, updatedAt: c.updatedAt
+        id: c.id,
+        authorName: c.authorName,
+        text: c.text,
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt
       }))
     }
   };
@@ -348,26 +478,41 @@ function evalStatus(idea){
   let statusNote  = 'No price/entry';
 
   if (!Number.isFinite(p) || !Number.isFinite(el)) {
-    m.statusLight = 'gray'; m.statusNote = statusNote; return m;
+    m.statusLight = 'gray';
+    m.statusNote  = statusNote;
+    return m;
   }
 
   const firstTarget = tgs.length ? tgs[0] : null;
 
   if (dir === 'long') {
-    if (Number.isFinite(sl) && p <= sl) { statusLight='red';  statusNote='Stop hit'; m.hitStop = true; }
-    else if (Number.isFinite(firstTarget) && p >= firstTarget) { statusLight='blue'; statusNote='Target reached'; if (m.hitTargetIndex == null) m.hitTargetIndex = 0; }
-    else if (p >= el) { statusLight='green'; statusNote='Above EL'; }
-    else { statusLight='orange'; statusNote='Below EL'; }
+    if (Number.isFinite(sl) && p <= sl) {
+      statusLight='red';  statusNote='Stop hit'; m.hitStop = true;
+    } else if (Number.isFinite(firstTarget) && p >= firstTarget) {
+      statusLight='blue'; statusNote='Target reached';
+      if (m.hitTargetIndex == null) m.hitTargetIndex = 0;
+    } else if (p >= el) {
+      statusLight='green'; statusNote='Above EL';
+    } else {
+      statusLight='orange'; statusNote='Below EL';
+    }
   } else if (dir === 'short') {
-    if (Number.isFinite(sl) && p >= sl) { statusLight='red';  statusNote='Stop hit'; m.hitStop = true; }
-    else if (Number.isFinite(firstTarget) && p <= firstTarget) { statusLight='blue'; statusNote='Target reached'; if (m.hitTargetIndex == null) m.hitTargetIndex = 0; }
-    else if (p <= el) { statusLight='green'; statusNote='Below EL'; }
-    else { statusLight='orange'; statusNote='Above EL'; }
+    if (Number.isFinite(sl) && p >= sl) {
+      statusLight='red';  statusNote='Stop hit'; m.hitStop = true;
+    } else if (Number.isFinite(firstTarget) && p <= firstTarget) {
+      statusLight='blue'; statusNote='Target reached';
+      if (m.hitTargetIndex == null) m.hitTargetIndex = 0;
+    } else if (p <= el) {
+      statusLight='green'; statusNote='Below EL';
+    } else {
+      statusLight='orange'; statusNote='Above EL';
+    }
   } else {
     statusLight='orange'; statusNote='Neutral';
   }
 
-  m.statusLight = statusLight; m.statusNote = statusNote;
+  m.statusLight = statusLight;
+  m.statusNote  = statusNote;
   return m;
 }
 
@@ -392,7 +537,9 @@ app.get('/ideas/:id', async (req, res) => {
 app.post('/ideas', requireAuth, async (req, res) => {
   const db = await loadDB();
   const it = normalizeIdea(req.body || {});
-  if (!it.imageUrl && Array.isArray(it.media) && it.media[0]?.url) it.imageUrl = it.media[0].url;
+  if (!it.imageUrl && Array.isArray(it.media) && it.media[0]?.url) {
+    it.imageUrl = it.media[0].url;
+  }
   db.ideas.unshift(it);
   await saveDB(db);
   const pub = ideaPublic(it);
@@ -424,7 +571,7 @@ app.patch('/ideas/:id', requireAuth, async (req, res) => {
   if (req.body.entryLevel!=null || req.body.entry!=null || req.body.el!=null)
     it.metrics.entry = nnum(req.body.entryLevel ?? req.body.entry ?? req.body.el);
   if (req.body.stopLevel!=null || req.body.stop!=null || req.body.sl!=null)
-    it.metrics.stop = nnum(req.body.stopLevel ?? req.body.stop ?? req.body.sl);
+    it.metrics.stop  = nnum(req.body.stopLevel ?? req.body.stop ?? req.body.sl);
   if (req.body.targets!=null || req.body.targetText!=null || req.body.tp!=null || req.body.tps!=null)
     it.metrics.targets = parseTargets(req.body.targets ?? req.body.targetText ?? req.body.tp ?? req.body.tps);
 
@@ -452,6 +599,7 @@ async function likeHandler(req, res) {
   const action      = String(req.body?.action || req.body?.op || '').toLowerCase();
   const userId      = String(req.body?.userId || req.body?.by || '').slice(0, 120) || 'device';
   const displayName = String(req.body?.displayName || req.body?.name || 'Member').slice(0, 120);
+
   if (!['like', 'unlike'].includes(action)) return err(res, 400, 'Invalid action');
 
   const db = await loadDB();
@@ -475,7 +623,10 @@ async function likeHandler(req, res) {
   const out = { id: it.id, likeCount: it.likes.count };
   sseSend('likes:update', out);
 
-  ok(res, { likeCount: it.likes.count, likes: { count: it.likes.count } });
+  ok(res, {
+    likeCount: it.likes.count,
+    likes: { count: it.likes.count }
+  });
 }
 app.put('/ideas/:id/likes', requireAuth, likeHandler);
 app.post('/ideas/:id/likes', requireAuth, likeHandler);
@@ -491,6 +642,7 @@ async function _commentAdd(req, res) {
   const text       = String(req.body?.text || '').trim();
   const authorId   = String(req.body?.authorId || '').slice(0, 120);
   const authorName = String(req.body?.authorName || 'Member').slice(0, 120);
+
   if (!text) return err(res, 400, 'text required');
 
   const c = {
@@ -504,6 +656,7 @@ async function _commentAdd(req, res) {
 
   it.comments ||= { items: [] };
   it.comments.items.push(c);
+
   await saveDB(db);
 
   const items = it.comments.items.map(x => ({
@@ -523,7 +676,8 @@ async function _commentEdit(req, res) {
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
-  const c = (it.comments?.items || []).find(x => String(x.id) === String(req.params.cid));
+  const c = (it.comments?.items || [])
+    .find(x => String(x.id) === String(req.params.cid));
   if (!c) return err(res, 404, 'comment not found');
 
   const text = String(req.body?.text || '').trim();
@@ -531,6 +685,7 @@ async function _commentEdit(req, res) {
 
   c.text = text;
   c.updatedAt = nowISO();
+
   await saveDB(db);
 
   const items = it.comments.items.map(x => ({
@@ -550,11 +705,9 @@ async function _commentDelete(req, res) {
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
-  // safety: make sure comments container exists
-  it.comments ||= { items: [] };
-
-  const before = (it.comments.items || []).length;
-  it.comments.items = (it.comments.items || []).filter(x => String(x.id) !== String(req.params.cid));
+  const before = (it.comments?.items || []).length;
+  it.comments.items = (it.comments?.items || [])
+    .filter(x => String(x.id) !== String(req.params.cid));
   const after = it.comments.items.length;
 
   if (before === after) return err(res, 404, 'comment not found');
@@ -581,23 +734,30 @@ app.delete('/ideas/:id/comments/:cid', requireAuth, _commentDelete);
 function smtpReady() {
   return !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true));
 }
+
 let transporter = null;
 function getTransporter() {
   if (!smtpReady()) return null;
   if (transporter) return transporter;
   transporter = nodemailer.createTransport({
-    host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_SECURE,
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
     auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-    connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 15000
   });
   return transporter;
 }
+
 function fromHeader() {
-  if (EMAIL_FROM_INLINE) return EMAIL_FROM_INLINE;
+  if (EMAIL_FROM) return EMAIL_FROM;
   if (MAIL_FROM) return `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`;
   if (SMTP_USER) return `"${MAIL_FROM_NAME}" <${SMTP_USER}>`;
   return `"${MAIL_FROM_NAME}" <no-reply@localhost>`;
 }
+
 function splitEmails(list) {
   return String(list || '')
     .split(/[,\s;]+/)
@@ -605,16 +765,21 @@ function splitEmails(list) {
     .filter(Boolean)
     .filter(e => EMAIL_RX.test(e));
 }
+
 function packToBcc(all) {
   const uniqd = uniq(all);
-  if (uniqd.length <= 1) return { to: uniqd[0] || undefined, bcc: undefined };
+  if (uniqd.length <= 1) {
+    return { to: uniqd[0] || undefined, bcc: undefined };
+  }
   return { to: uniqd[0], bcc: uniqd.slice(1) };
 }
+
 function _esc(s) {
   return String(s || '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
+
 function _bullets(s) {
   const parts = String(s || '')
     .split(/\r?\n|[;•]\s*/g)
@@ -625,7 +790,20 @@ function _bullets(s) {
     ${parts.map(li => `<li style="margin:6px 0;line-height:1.45">${_esc(li)}</li>`).join('')}
   </ul>`;
 }
-function _emailShell({ preheader, title, symbol, levelsHTML, planHTML, imgUrl, ctaHref, ctaText, badgeText, theme, statusColor }) {
+
+function _emailShell({
+  preheader,
+  title,
+  symbol,
+  levelsHTML,
+  planHTML,
+  imgUrl,
+  ctaHref,
+  ctaText,
+  badgeText,
+  theme,
+  statusColor
+}) {
   const isClear = ['clear','transparent','none','minimal','white'].includes(theme);
   const logo = absUrl(LOGO_URL);
   const brand = MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
@@ -647,10 +825,12 @@ function _emailShell({ preheader, title, symbol, levelsHTML, planHTML, imgUrl, c
   const visitColor = isClear ? '#164a76' : '#cfe8ff';
   const visitBor   = isClear ? '1px solid rgba(0,0,0,0.12)' : '1px solid rgba(255,255,255,0.14)';
 
-  const dot = statusColor ? `<span style="display:inline-block;width:10px;height:10px;border-radius:999px;margin-right:8px;vertical-align:middle;background:${statusColor}"></span>` : '';
+  const dot = statusColor
+    ? `<span style="display:inline-block;width:10px;height:10px;border-radius:999px;margin-right:8px;vertical-align:middle;background:${statusColor}"></span>`
+    : '';
 
   return `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${_esc(title)}</title></head>
 <body style="margin:0;padding:0;${bodyBg}">
   <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent">${_esc(preheader || title)}</div>
@@ -708,6 +888,7 @@ function _emailShell({ preheader, title, symbol, levelsHTML, planHTML, imgUrl, c
   </table>
 </body></html>`;
 }
+
 function emailTemplatePost(item) {
   const title   = item?.title || 'New Idea';
   const symbol  = item?.symbol || '';
@@ -716,13 +897,25 @@ function emailTemplatePost(item) {
   const imgUrl  = firstImageUrl(item);
   const deepURL = ideaDeepLink(item);
   const pre     = `${symbol ? symbol + ' • ' : ''}${title}`;
-  return _emailShell({
+
+  const html = _emailShell({
     preheader: `New Idea — ${pre}`,
-    title, symbol, levelsHTML: levels, planHTML: plan,
-    imgUrl, ctaHref: deepURL, ctaText: 'Open on Dashboard',
-    badgeText: '🔔 New Idea', theme: EMAIL_THEME
+    title,
+    symbol,
+    levelsHTML: levels,
+    planHTML: plan,
+    imgUrl,
+    ctaHref: deepURL,
+    ctaText: 'Open on Dashboard',
+    badgeText: '🔔 New Idea',
+    theme: EMAIL_THEME
   });
+
+  const subject = `🔔 New Idea: ${symbol ? `${symbol} — `:''}${title || 'Update'}`;
+
+  return { subject, html };
 }
+
 function emailTemplateStatus(item, kind /* 'stop' | 'target' */, info) {
   const title   = item?.title || '';
   const symbol  = item?.symbol || '';
@@ -730,37 +923,65 @@ function emailTemplateStatus(item, kind /* 'stop' | 'target' */, info) {
   const plan    = _bullets(item?.take || item?.content || '');
   const imgUrl  = firstImageUrl(item);
   const deepURL = ideaDeepLink(item);
+
   const color   = kind==='stop' ? '#ff335a' : '#2fa8ff';
-  const badge   = kind==='stop' ? '🟥 Stop Hit' : `🟦 Target ${info?.label||''} Hit`;
-  const subj    = kind==='stop' ? `🟥 STOP: ${symbol} — ${title}` : `🟦 TARGET: ${symbol} — ${title}`;
-  return {
-    subject: subj,
-    html: _emailShell({
-      preheader: subj, title, symbol, levelsHTML: levels, planHTML: plan,
-      imgUrl, ctaHref: deepURL, ctaText: 'Open on Dashboard',
-      badgeText: badge, theme: EMAIL_THEME, statusColor: color
-    })
-  };
+  const badge   = kind==='stop'
+    ? '🟥 Stop Hit'
+    : `🟦 Target ${info?.label||''} Hit`;
+
+  const subj    = kind==='stop'
+    ? `🟥 STOP: ${symbol} — ${title}`
+    : `🟦 TARGET: ${symbol} — ${title}`;
+
+  const html = _emailShell({
+    preheader: subj,
+    title,
+    symbol,
+    levelsHTML: levels,
+    planHTML: plan,
+    imgUrl,
+    ctaHref: deepURL,
+    ctaText: 'Open on Dashboard',
+    badgeText: badge,
+    theme: EMAIL_THEME,
+    statusColor: color
+  });
+
+  return { subject: subj, html };
 }
+
 async function recipientsFor(reqBody){
+  // 1. EMAIL_FORCE_ALL_TO overrides everything (great for testing)
   const forced = splitEmails(EMAIL_FORCE_ALL_TO);
   if (forced.length) return { list: forced, mode:'forced' };
 
+  // 2. active subscribers
   const subs = await loadSubs().catch(()=>blankSubs());
-  const list = uniq((subs.subs||[]).map(s=>String(s.email||'').toLowerCase()).filter(e=>EMAIL_RX.test(e)));
+  const list = uniq((subs.subs||[])
+    .map(s=>String(s.email||'').toLowerCase())
+    .filter(e=>EMAIL_RX.test(e)));
   if (list.length) return { list, mode:'subs' };
 
-  const actorEmail = String(reqBody?.actor?.email || reqBody?.actorEmail || '').trim().toLowerCase();
+  // 3. actor email (fallback for manual post)
+  const actorEmail = String(reqBody?.actor?.email || reqBody?.actorEmail || '')
+    .trim()
+    .toLowerCase();
   if (EMAIL_RX.test(actorEmail)) return { list:[actorEmail], mode:'actor' };
 
+  // 4. admin BCC only
   const admins = (EMAIL_BCC_ADMIN || []).filter(e => EMAIL_RX.test(e));
-  return admins.length ? { list: admins, mode:'admin' } : { list: [], mode:'none' };
+  return admins.length
+    ? { list: admins, mode:'admin' }
+    : { list: [], mode:'none' };
 }
+
 function getMailer(){
   if (!smtpReady()) return null;
   return getTransporter();
 }
+
 async function sendEmailBlast({ subject, html, toList }){
+  // Try SMTP first
   try{
     const tx = getMailer();
     if (tx && toList.length){
@@ -769,6 +990,7 @@ async function sendEmailBlast({ subject, html, toList }){
       const adminBcc = EMAIL_BCC_ADMIN;
       const { to, bcc } = packToBcc(toList);
       const finalBcc = uniq([...(bcc || []), ...adminBcc]);
+
       const info = await tx.sendMail({
         from,
         to: to || undefined,
@@ -777,24 +999,34 @@ async function sendEmailBlast({ subject, html, toList }){
         html,
         replyTo
       });
-      return { sent: toList.length, messageId: info?.messageId || '', via:'smtp' };
+
+      return {
+        sent: toList.length,
+        messageId: info?.messageId || '',
+        via:'smtp'
+      };
     }
   }catch(e){
     console.warn('[email][smtp] failed, trying HTTP fallback:', e?.message || e);
   }
 
+  // Fallback: Mailjet REST API using SMTP_USER/SMTP_PASS
   if (!(SMTP_USER && SMTP_PASS)) throw new Error('No SMTP creds for HTTP fallback');
   if (!toList.length) return { sent:0, via:'http' };
 
   const payload = {
     Messages: [{
-      From: { Email: (MAIL_FROM || SMTP_USER), Name: MAIL_FROM_NAME || 'Notifier' },
+      From: {
+        Email: (MAIL_FROM || SMTP_USER),
+        Name: MAIL_FROM_NAME || 'Notifier'
+      },
       To: toList.map(e => ({ Email: e })),
       Subject: subject,
       HTMLPart: html,
       Headers: EMAIL_REPLY_TO ? { 'Reply-To': EMAIL_REPLY_TO } : undefined
     }]
   };
+
   const auth = Buffer.from(`${SMTP_USER}:${SMTP_PASS}`).toString('base64');
   const body = JSON.stringify(payload);
 
@@ -810,16 +1042,22 @@ async function sendEmailBlast({ subject, html, toList }){
       },
       timeout: 12000
     }, res=>{
-      let data=''; res.on('data', c=> data+=c);
-      res.on('end', ()=> res.statusCode >= 200 && res.statusCode < 300
-        ? resolve({ ok:true, status: res.statusCode, body: data })
-        : reject(new Error(`Mailjet HTTP ${res.statusCode} ${data.slice(0,200)}`)));
+      let data='';
+      res.on('data', c=> data+=c);
+      res.on('end', ()=>{
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ ok:true, status: res.statusCode, body: data });
+        } else {
+          reject(new Error(`Mailjet HTTP ${res.statusCode} ${data.slice(0,200)}`));
+        }
+      });
     });
     req.on('timeout', ()=>{ req.destroy(new Error('Mailjet HTTP timeout')); });
     req.on('error', reject);
     req.write(body);
     req.end();
   });
+
   return { sent: toList.length, via: 'http', raw: httpResult.status };
 }
 
@@ -830,11 +1068,21 @@ app.post('/email/post', requireAuth, async (req, res) => {
     if (!item) return err(res, 400, 'item required');
 
     const { list, mode } = await recipientsFor(req.body || {});
-    if (!list.length) return ok(res, { ok:true, sent:0, info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)' });
+    if (!list.length) {
+      return ok(res, {
+        ok:true,
+        sent:0,
+        info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)'
+      });
+    }
 
-    const subject = `🔔 New Idea: ${item.symbol ? `${item.symbol} — `:''}${item.title||'Update'}`;
-    const html = emailTemplatePost(item);
-    const result = await sendEmailBlast({ subject, html, toList:list });
+    const tpl = emailTemplatePost(item);
+    const result = await sendEmailBlast({
+      subject: tpl.subject,
+      html: tpl.html,
+      toList:list
+    });
+
     ok(res, { ok:true, sent: result.sent, mode, via: result.via });
   }catch(e){
     err(res, 500, e.message || 'Email failed');
@@ -844,10 +1092,14 @@ app.post('/email/post', requireAuth, async (req, res) => {
 /* ---------------------- STATUS EMAIL TRIGGERS ----- */
 async function maybeNotify(idea, reason /* 'stop' | 'target' */, info) {
   try{
-    const { list } = await recipientsFor({}); // subs/admins/forced
+    const { list } = await recipientsFor({});
     if (!list.length) return;
     const tpl = emailTemplateStatus(idea, reason, info);
-    await sendEmailBlast({ subject: tpl.subject, html: tpl.html, toList: list });
+    await sendEmailBlast({
+      subject: tpl.subject,
+      html: tpl.html,
+      toList: list
+    });
   } catch (e){
     console.warn('[notify]', reason, idea?.id, e?.message || e);
   }
@@ -858,13 +1110,17 @@ async function maybeNotify(idea, reason /* 'stop' | 'target' */, info) {
  *  body: { symbol?: string, id?: string, price: number, at?: ISO }
  *  - If id present -> update that idea
  *  - else update ALL live ideas matching symbol
- *  - Triggers SSE idea:status + idea:update and emails on stop/target
+ *  - Triggers SSE idea:status + idea:update
+ *  - Fires email once on stop/target hit
+ *
+ * We ALSO gate this route with checkReferer() so only approved
+ * referers/origins (tradingview etc.) can hit it in production.
  ---------------------------------------------------*/
-app.post('/price/ping', requireAuth, async (req, res) => {
-  const price = nnum(req.body?.price);
-  const at    = String(req.body?.at || nowISO());
-  const symbol= String(req.body?.symbol || '').trim().toUpperCase();
-  const id    = String(req.body?.id || '').trim();
+app.post('/price/ping', checkReferer, requireAuth, async (req, res) => {
+  const price  = nnum(req.body?.price);
+  const at     = String(req.body?.at || nowISO());
+  const symbol = String(req.body?.symbol || '').trim().toUpperCase();
+  const id     = String(req.body?.id || '').trim();
 
   if (!Number.isFinite(price)) return err(res, 400, 'price required');
 
@@ -873,7 +1129,7 @@ app.post('/price/ping', requireAuth, async (req, res) => {
 
   const updateOne = async (it) => {
     it.metrics ||= {};
-    it.metrics.last = price;
+    it.metrics.last   = price;
     it.metrics.lastAt = at;
 
     const beforeLight = it.metrics.statusLight;
@@ -882,27 +1138,41 @@ app.post('/price/ping', requireAuth, async (req, res) => {
 
     evalStatus(it);
 
-    // Target indexing (first hit)
+    // Hit first target logic:
     const dir = it.direction || 'neutral';
-    const tgs = Array.isArray(it.metrics.targets) ? it.metrics.targets.map(Number) : [];
+    const tgs = Array.isArray(it.metrics.targets)
+      ? it.metrics.targets.map(Number)
+      : [];
+
     if (tgs.length) {
       if (dir === 'long') {
         const idx = tgs.findIndex(tp => Number.isFinite(tp) && price >= tp);
-        if (idx >= 0 && (it.metrics.hitTargetIndex == null || idx < it.metrics.hitTargetIndex)) it.metrics.hitTargetIndex = idx;
+        if (idx >= 0 && (it.metrics.hitTargetIndex == null || idx < it.metrics.hitTargetIndex)) {
+          it.metrics.hitTargetIndex = idx;
+        }
       } else if (dir === 'short') {
         const idx = tgs.findIndex(tp => Number.isFinite(tp) && price <= tp);
-        if (idx >= 0 && (it.metrics.hitTargetIndex == null || idx < it.metrics.hitTargetIndex)) it.metrics.hitTargetIndex = idx;
+        if (idx >= 0 && (it.metrics.hitTargetIndex == null || idx < it.metrics.hitTargetIndex)) {
+          it.metrics.hitTargetIndex = idx;
+        }
       }
     }
 
-    // Notify once
+    // Notify-once logic
     it.metrics.notified ||= { stop:false, targets:{} };
+
     if (it.metrics.statusLight === 'red' && !it.metrics.notified.stop) {
       it.metrics.notified.stop = true;
       await maybeNotify(it, 'stop');
-    } else if (Number.isFinite(it.metrics.hitTargetIndex) && !it.metrics.notified.targets[it.metrics.hitTargetIndex]) {
+    } else if (
+      Number.isFinite(it.metrics.hitTargetIndex) &&
+      !it.metrics.notified.targets[it.metrics.hitTargetIndex]
+    ) {
       it.metrics.notified.targets[it.metrics.hitTargetIndex] = true;
-      await maybeNotify(it, 'target', { index: it.metrics.hitTargetIndex, label: `T${it.metrics.hitTargetIndex+1}` });
+      await maybeNotify(it, 'target', {
+        index: it.metrics.hitTargetIndex,
+        label: `T${it.metrics.hitTargetIndex+1}`
+      });
     }
 
     it.updatedAt = nowISO();
@@ -921,7 +1191,7 @@ app.post('/price/ping', requireAuth, async (req, res) => {
       }
     });
 
-    // And a full update for clients that only listen to idea:update
+    // And also a full update for clients that only listen to idea:update
     sseSend('idea:update', ideaPublic(it));
   };
 
@@ -933,15 +1203,22 @@ app.post('/price/ping', requireAuth, async (req, res) => {
       String(x.symbol || '').toUpperCase() === symbol &&
       x.status !== 'archived'
     );
-    for (const it of list) await updateOne(it);
+    for (const it of list) {
+      await updateOne(it);
+    }
   } else {
     return err(res, 400, 'provide id or symbol');
   }
 
   if (touched.length) {
     await saveDB(db);
-    return ok(res, { ok:true, updated: touched.length, items: touched });
+    return ok(res, {
+      ok:true,
+      updated: touched.length,
+      items: touched
+    });
   }
+
   return ok(res, { ok:true, updated: 0, items: [] });
 });
 
@@ -949,14 +1226,24 @@ app.post('/price/ping', requireAuth, async (req, res) => {
 async function subscribeCore(email, name) {
   const s = await loadSubs();
   const exists = (s.subs || []).find(x => x.email === email);
-  if (!exists) (s.subs ||= []).push({ email, name, createdAt: nowISO(), status: 'active' });
+  if (!exists) {
+    (s.subs ||= []).push({
+      email,
+      name,
+      createdAt: nowISO(),
+      status: 'active'
+    });
+  }
   await saveSubs(s);
   return { ok: true };
 }
+
 app.post('/subscribe', requireAuth, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const name  = String(req.body?.name || 'Member').trim();
-  if (!email || !EMAIL_RX.test(email)) return err(res, 400, 'Valid email required');
+  if (!email || !EMAIL_RX.test(email)) {
+    return err(res, 400, 'Valid email required');
+  }
   const out = await subscribeCore(email, name);
   ok(res, out);
 });
@@ -977,23 +1264,38 @@ app.get('/debug/email/status', requireAuth, (_req, res) => {
   ok(res, {
     smtp: {
       ready: !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true)),
-      host: SMTP_HOST || null, port: SMTP_PORT || null, secure: SMTP_SECURE,
-      hasUser: !!SMTP_USER, hasPass: !!SMTP_PASS,
+      host: SMTP_HOST || null,
+      port: SMTP_PORT || null,
+      secure: SMTP_SECURE,
+      hasUser: !!SMTP_USER,
+      hasPass: !!SMTP_PASS,
     },
     branding: {
-      siteUrl: SITE_URL, logo: LOGO_URL, from: fromHeader(),
-      bccAdmins: EMAIL_BCC_ADMIN, forceTo: EMAIL_FORCE_ALL_TO || null,
+      siteUrl: SITE_URL,
+      logo: LOGO_URL,
+      from: fromHeader(),
+      bccAdmins: EMAIL_BCC_ADMIN,
+      forceTo: EMAIL_FORCE_ALL_TO || null,
       uploadsPublicBaseUrl: UPLOADS_PUBLIC_BASE_URL || null,
-      assetBaseUrl: ASSET_BASE_URL, emailTheme: EMAIL_THEME
+      assetBaseUrl: ASSET_BASE_URL,
+      emailTheme: EMAIL_THEME
     }
   });
 });
 
 app.post('/debug/email/test', requireAuth, async (req, res) => {
   try {
-    const rawTo = req.query.to || req.body?.to || EMAIL_FORCE_ALL_TO || (EMAIL_BCC_ADMIN || []).join(',');
+    const rawTo = req.query.to
+      || req.body?.to
+      || EMAIL_FORCE_ALL_TO
+      || (EMAIL_BCC_ADMIN || []).join(',');
+
     const toList = splitEmails(rawTo);
-    if (!toList.length) return err(res, 400, 'provide ?to= or set EMAIL_FORCE_ALL_TO or EMAIL_BCC_ADMIN');
+    if (!toList.length) {
+      return err(res, 400,
+        'provide ?to= or set EMAIL_FORCE_ALL_TO or EMAIL_BCC_ADMIN'
+      );
+    }
 
     const imgParam = req.query.img || req.body?.img || '';
     const imgUrl   = absUrl(imgParam);
@@ -1016,7 +1318,13 @@ app.post('/debug/email/test', requireAuth, async (req, res) => {
       html,
       toList
     });
-    ok(res, { ok:true, sent: result.sent, via: result.via, img: imgUrl });
+
+    ok(res, {
+      ok:true,
+      sent: result.sent,
+      via: result.via,
+      img: imgUrl
+    });
   } catch (e) {
     err(res, 500, e.message || 'Test email failed');
   }
