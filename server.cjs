@@ -3,10 +3,10 @@
  * + live status engine (EL/SL/TPs) + stop/target email triggers
  *
  * This version:
- * - stays CommonJS (works with "type": "commonjs")
- * - dynamic CORS allowlist (Wix, localhost, *.filesusr.com, *.wixsite.com, etc.)
- * - referer allowlist for /price/ping using ALLOW_FETCH_REFERERS env
- * - SSE live updates for dashboard
+ * - CommonJS, no ESM imports
+ * - Removes nanoid package (which was ESM-only)
+ * - Uses internal nanoid() implemented with crypto
+ * - CORS allowlist + referer allowlist for /price/ping
  */
 
 'use strict';
@@ -19,7 +19,14 @@ const cors = require('cors');
 const multer = require('multer');
 const nodemailer = require('nodemailer');
 const https = require('https');
-const { nanoid } = require('nanoid');
+const crypto = require('crypto');
+
+/* ---------------------- ID HELPER ----------------- */
+/* generate short url-safe IDs similar to nanoid */
+function nanoid(size = 12) {
+  // crypto.randomBytes(size) -> base64url string -> slice to length
+  return crypto.randomBytes(size).toString('base64url').slice(0, size);
+}
 
 /* ---------------------- ENV ---------------------- */
 const PORT      = process.env.PORT || 8080;
@@ -259,7 +266,7 @@ const app = express();
 
 /* ----- CORS allow logic ----- */
 function isOriginAllowed(origin) {
-  if (!origin) return true; // no Origin header (curl, server->server) -> allow
+  if (!origin) return true; // no Origin header -> allow (curl / server2server)
 
   if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return true;
 
@@ -271,12 +278,12 @@ function isOriginAllowed(origin) {
       return protocol === 'https:';
     }
 
-    // Wix media files / filesusr.com
+    // Wix CDN/media
     if (host.endsWith('.filesusr.com')) {
       return protocol === 'https:';
     }
 
-    // wildcard entries like https://*.wixsite.com
+    // wildcard like https://*.wixsite.com
     for (const pat of CORS_ORIGINS) {
       if (!pat.includes('*')) continue;
       const m = pat.match(/^https?:\/\/\*\.(.+)$/i);
@@ -288,7 +295,6 @@ function isOriginAllowed(origin) {
     // localhost dev
     if (/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host)) return true;
   } catch {
-    // bad Origin header -> block
     return false;
   }
   return false;
@@ -1132,13 +1138,9 @@ app.post('/price/ping', checkReferer, requireAuth, async (req, res) => {
     it.metrics.last   = price;
     it.metrics.lastAt = at;
 
-    const beforeLight = it.metrics.statusLight;
-    const beforeStop  = !!it.metrics.hitStop;
-    const beforeTIdx  = it.metrics.hitTargetIndex;
-
     evalStatus(it);
 
-    // Hit first target logic:
+    // Track first target hit
     const dir = it.direction || 'neutral';
     const tgs = Array.isArray(it.metrics.targets)
       ? it.metrics.targets.map(Number)
@@ -1158,7 +1160,7 @@ app.post('/price/ping', checkReferer, requireAuth, async (req, res) => {
       }
     }
 
-    // Notify-once logic
+    // Notify once
     it.metrics.notified ||= { stop:false, targets:{} };
 
     if (it.metrics.statusLight === 'red' && !it.metrics.notified.stop) {
@@ -1191,7 +1193,7 @@ app.post('/price/ping', checkReferer, requireAuth, async (req, res) => {
       }
     });
 
-    // And also a full update for clients that only listen to idea:update
+    // And full update for listeners that only use idea:update
     sseSend('idea:update', ideaPublic(it));
   };
 
