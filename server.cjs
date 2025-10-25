@@ -20,24 +20,26 @@ const crypto = require('crypto');
 const PORT      = process.env.PORT || 8080;
 const NODE_ENV  = process.env.NODE_ENV || 'production';
 
-const API_TOKEN  = process.env.API_TOKEN || '';
+const API_TOKEN  = process.env.API_TOKEN  || '';
 const JWT_SECRET = process.env.JWT_SECRET || ''; // must match Wix Secret "JWT_SECRET"
 
-const _corsEnv   = process.env.CORS_ORIGINS || process.env.CORS_ALLOW_ORIGINS || '*';
+const _corsEnv  = process.env.CORS_ORIGINS || process.env.CORS_ALLOW_ORIGINS || '*';
 const CORS_ORIGINS = _corsEnv.split(',').map(s => s.trim()).filter(Boolean);
 
-const DATA_DIR   = process.env.DATA_DIR   || '/data';
-const DATA_FILE  = path.join(DATA_DIR, 'ideas.json');
-const SUBS_FILE  = path.join(DATA_DIR, 'subscribers.json');
-const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
+const DATA_DIR    = process.env.DATA_DIR   || '/data';
+const DATA_FILE   = path.join(DATA_DIR, 'ideas.json');
+const SUBS_FILE   = path.join(DATA_DIR, 'subscribers.json');
+const UPLOAD_DIR  = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
 
 const UPLOADS_PUBLIC_BASE_URL = (process.env.UPLOADS_PUBLIC_BASE_URL || '').replace(/\/+$/,'');
 
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 8);
 const ALLOWED_UPLOAD_TYPES = (process.env.ALLOWED_UPLOAD_TYPES
-  || 'image/png,image/jpeg,image/webp,image/gif').split(',').map(s => s.trim());
+  || 'image/png,image/jpeg,image/webp,image/gif')
+  .split(',')
+  .map(s => s.trim());
 
-/* ---------------------- EMAIL ENV ---------------- */
+/* ---------------------- EMAIL -------------------- */
 const SMTP_HOST   = process.env.SMTP_HOST   || '';
 const SMTP_PORT   = Number(process.env.SMTP_PORT || 587);
 const SMTP_SECURE = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || SMTP_PORT === 465;
@@ -49,7 +51,9 @@ const MAIL_FROM_NAME    = process.env.MAIL_FROM_NAME || 'Trade Chart Patterns Li
 const EMAIL_FROM_INLINE = process.env.EMAIL_FROM || '';
 const EMAIL_REPLY_TO    = (process.env.EMAIL_REPLY_TO || '').trim();
 const EMAIL_BCC_ADMIN   = (process.env.EMAIL_BCC_ADMIN || '')
-  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
 const EMAIL_FORCE_ALL_TO = (process.env.EMAIL_FORCE_ALL_TO || '').trim().toLowerCase();
 
 const SITE_NAME   = process.env.SITE_NAME   || 'Trade Chart Patterns — Pro';
@@ -71,7 +75,6 @@ async function ensureDir(p) {
 function ok(res, data) {
   res.json(data);
 }
-
 function err(res, code, msg) {
   res.status(code).json({ status:'error', code, message: msg || 'Error' });
 }
@@ -80,14 +83,15 @@ function absUrl(u) {
   const s = String(u || '').trim();
   if (!s) return '';
   if (/^https?:\/\//i.test(s)) return s;
-  const base = (UPLOADS_PUBLIC_BASE_URL || ASSET_BASE_URL || SITE_URL || '').replace(/\/+$/,'');
+  const base = (UPLOADS_PUBLIC_BASE_URL || ASSET_BASE_URL || SITE_URL || '')
+    .replace(/\/+$/,'');
   return base + (s.startsWith('/') ? s : `/${s}`);
 }
 
 const EMAIL_RX = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const uniq = a => Array.from(new Set(a || []));
 
-// small, safe id (avoids ESM nanoid issue)
+// safe short id (replaces nanoid which is ESM)
 function uid(n=12){
   return crypto.randomBytes(n).toString('base64url').slice(0,n);
 }
@@ -97,7 +101,6 @@ function nnum(v){
   const n = Number(String(v).replace(/[^\d.\-]/g, ''));
   return Number.isFinite(n) ? n : null;
 }
-
 function parseTargets(v){
   if (Array.isArray(v)) return v.map(nnum).filter(Number.isFinite);
   const s = String(v || '');
@@ -107,6 +110,7 @@ function parseTargets(v){
 
 /* -------------------- STORAGE -------------------- */
 const blankDB   = () => ({ ideas: [] });
+const blankSubs = () => ({ subs: [] });
 
 async function loadDB() {
   try {
@@ -130,10 +134,11 @@ async function saveDB(db) {
 /* ---------------------- AUTH ---------------------- */
 function readBearer(req) {
   const h = req.headers['authorization'];
-  if (h && /^Bearer\s+/i.test(h)) return h.replace(/^Bearer\s+/i, '').trim();
+  if (h && /^Bearer\s+/i.test(h)) {
+    return h.replace(/^Bearer\s+/i, '').trim();
+  }
   return '';
 }
-
 function readQueryToken(req) {
   return (req.query && String(req.query.token || '').trim()) || '';
 }
@@ -141,7 +146,7 @@ function readQueryToken(req) {
 function decodeUser(token){
   if (!token) return null;
 
-  // Legacy static token => admin
+  // Legacy static API token => treat as admin
   if (API_TOKEN && token === API_TOKEN) {
     return {
       id:'admin',
@@ -166,7 +171,6 @@ function decodeUser(token){
       };
     } catch (_) {}
   }
-
   return null;
 }
 
@@ -181,7 +185,6 @@ function requireUser(req, res, next){
   req.user = u;
   next();
 }
-
 function requireAdmin(req, res, next){
   const u = readUser(req);
   if (!u) return err(res, 401, 'Unauthorized');
@@ -198,14 +201,12 @@ function sseAuthOK(req) {
 
 /* ----------------------- SSE ---------------------- */
 const clients = new Set(); // { id, res, ping }
-
 function sseSend(event, data) {
   const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const c of clients) {
     try { c.res.write(line); } catch {}
   }
 }
-
 function sseSendTo(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
@@ -216,20 +217,24 @@ const app = express();
 function isOriginAllowed(origin) {
   if (!origin) return true;
   if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return true;
+
   try {
     const { protocol, host } = new URL(origin);
-
-    if (host.endsWith('.wixsite.com'))    return protocol === 'https:';
+    // allow *.wixsite.com or *.filesusr.com
+    if (host.endsWith('.wixsite.com'))   return protocol === 'https:';
     if (host.endsWith('.filesusr.com'))  return protocol === 'https:';
 
+    // wildcard patterns like https://*.yourdomain.com
     for (const pat of CORS_ORIGINS) {
       if (!pat.includes('*')) continue;
       const m = pat.match(/^https?:\/\/\*\.(.+)$/i);
       if (m && host.endsWith(m[1])) return protocol === 'https:';
     }
 
+    // localhost dev
     if (/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host)) return true;
   } catch {}
+
   return false;
 }
 
@@ -240,7 +245,6 @@ app.use(cors({
 
 app.use(express.json({ limit: '1mb' }));
 
-// public uploaded images
 app.use('/uploads', express.static(UPLOAD_DIR, {
   index: false,
   maxAge: '30d',
@@ -250,11 +254,9 @@ app.use('/uploads', express.static(UPLOAD_DIR, {
 }));
 
 /* ---------------------- HEALTH ------------------- */
-app.get('/health', (_req, res) => ok(res, {
-  ok: true,
-  env: NODE_ENV,
-  time: nowISO()
-}));
+app.get('/health', (_req, res) => {
+  ok(res, { ok: true, env: NODE_ENV, time: nowISO() });
+});
 
 /* ---------------------- EVENTS (SSE) ------------- */
 app.get('/events', (req, res) => {
@@ -266,9 +268,7 @@ app.get('/events', (req, res) => {
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no'
   });
-
-  // flushHeaders() isn't always there, so optional-call
-  res.flushHeaders && res.flushHeaders();
+  res.flushHeaders?.();
 
   const id = uid(10);
   const client = { id, res, ping: null };
@@ -289,14 +289,15 @@ app.get('/events', (req, res) => {
 /* -------------------- NORMALIZATION -------------- */
 function normalizeDirection(v) {
   const s = String(v || '').toLowerCase();
-  if (s === 'long'  || s === 'buy')  return 'long';
+  if (s === 'long' || s === 'buy')  return 'long';
   if (s === 'short' || s === 'sell') return 'short';
   return 'neutral';
 }
 
 function firstImageUrl(item) {
-  const raw = item?.imageUrl ||
-    (Array.isArray(item?.media) && item.media[0] && item.media[0].url) || '';
+  const raw = item?.imageUrl
+    || (Array.isArray(item?.media) && item.media[0] && item.media[0].url)
+    || '';
   return absUrl(raw);
 }
 
@@ -304,16 +305,15 @@ function ideaDeepLink(item) {
   const base = `${SITE_URL}/trading-dashboard`;
   const id   = String(item?.id || '').trim();
   if (!id) return base;
-  const q = `?idea=${encodeURIComponent(id)}&utm_source=email&utm_medium=notification&utm_campaign=${
-    encodeURIComponent(item?.symbol ? 'idea-'+item.symbol : 'idea')}`;
+  const q    = `?idea=${encodeURIComponent(id)}&utm_source=email&utm_medium=notification&utm_campaign=${encodeURIComponent(item?.symbol ? 'idea-'+item.symbol : 'idea')}`;
   return `${base}${q}`;
 }
 
 function normalizeIdea(input, author /* {id,name,email} */) {
   const now = nowISO();
   const dir = normalizeDirection(input.direction || input.bias);
-  const entry   = nnum(input.entryLevel ?? input.entry ?? input.el);
-  const stop    = nnum(input.stopLevel  ?? input.stop  ?? input.sl);
+  const entry = nnum(input.entryLevel ?? input.entry ?? input.el);
+  const stop  = nnum(input.stopLevel  ?? input.stop  ?? input.sl);
   const targets = parseTargets(input.targets ?? input.targetText ?? input.tps ?? input.tp);
 
   return {
@@ -329,7 +329,7 @@ function normalizeIdea(input, author /* {id,name,email} */) {
     media: Array.isArray(input.media)
       ? input.media.map(m => ({
           kind: String(m.kind || 'image'),
-          url: String(m.url || '')
+          url:  String(m.url  || '')
         }))
       : [],
     direction: dir,
@@ -404,11 +404,11 @@ function ideaPublic(it, you){
 
 /* -------------------- STATUS ENGINE -------------- */
 function evalStatus(idea){
-  const m   = idea.metrics ||= {};
+  const m = idea.metrics ||= {};
   const dir = idea.direction || 'neutral';
-  const p   = Number(m.last);
-  const el  = Number(m.entry);
-  const sl  = Number(m.stop);
+  const p = Number(m.last);
+  const el = Number(m.entry);
+  const sl = Number(m.stop);
   const tgs = Array.isArray(m.targets) ? m.targets.map(Number) : [];
 
   let statusLight = 'gray';
@@ -416,7 +416,7 @@ function evalStatus(idea){
 
   if (!Number.isFinite(p) || !Number.isFinite(el)) {
     m.statusLight = 'gray';
-    m.statusNote  = statusNote;
+    m.statusNote = statusNote;
     return m;
   }
 
@@ -454,11 +454,13 @@ function evalStatus(idea){
 }
 
 /* -------------------- IDEAS CRUD ------------------ */
+
+// latest feed
 app.get('/ideas/latest', async (req, res) => {
   const limit = Math.min(Number(req.query.limit || 30), 100);
   const you   = readUser(req) || null;
-
   const db = await loadDB();
+
   const items = [...db.ideas]
     .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, limit)
@@ -467,24 +469,22 @@ app.get('/ideas/latest', async (req, res) => {
   ok(res, { items, ideas: items });
 });
 
+// single idea
 app.get('/ideas/:id', async (req, res) => {
   const you = readUser(req) || null;
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
-
   ok(res, { item: ideaPublic(it, you) });
 });
 
+// create idea
 app.post('/ideas', requireUser, async (req, res) => {
   const db = await loadDB();
-
   const it = normalizeIdea(req.body || {}, req.user);
-
   if (!it.imageUrl && Array.isArray(it.media) && it.media[0]?.url) {
     it.imageUrl = it.media[0].url;
   }
-
   db.ideas.unshift(it);
   await saveDB(db);
 
@@ -493,6 +493,7 @@ app.post('/ideas', requireUser, async (req, res) => {
   ok(res, { item: pub });
 });
 
+// update idea
 app.patch('/ideas/:id', requireUser, async (req, res) => {
   const db = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
@@ -513,21 +514,35 @@ app.patch('/ideas/:id', requireUser, async (req, res) => {
     levelText: req.body.levelText ?? it.levelText,
     take:      req.body.take      ?? it.take,
     link:      req.body.link      ?? it.link,
-    imageUrl:  (typeof req.body.imageUrl === 'string' ? req.body.imageUrl : it.imageUrl),
-    media:     Array.isArray(req.body.media) ? req.body.media : it.media,
-    direction: normalizeDirection(req.body.direction ?? req.body.bias ?? it.direction),
+    imageUrl:  (typeof req.body.imageUrl === 'string'
+                ? req.body.imageUrl
+                : it.imageUrl),
+    media: Array.isArray(req.body.media)
+      ? req.body.media
+      : it.media,
+    direction: normalizeDirection(
+      req.body.direction ?? req.body.bias ?? it.direction
+    ),
     updatedAt: nowISO()
   });
 
   it.metrics ||= {};
-
   if (req.body.entryLevel!=null || req.body.entry!=null || req.body.el!=null) {
-    it.metrics.entry = nnum(req.body.entryLevel ?? req.body.entry ?? req.body.el);
+    it.metrics.entry = nnum(
+      req.body.entryLevel ?? req.body.entry ?? req.body.el
+    );
   }
   if (req.body.stopLevel!=null || req.body.stop!=null || req.body.sl!=null) {
-    it.metrics.stop = nnum(req.body.stopLevel ?? req.body.stop ?? req.body.sl);
+    it.metrics.stop = nnum(
+      req.body.stopLevel ?? req.body.stop ?? req.body.sl
+    );
   }
-  if (req.body.targets!=null || req.body.targetText!=null || req.body.tp!=null || req.body.tps!=null) {
+  if (
+    req.body.targets!=null ||
+    req.body.targetText!=null ||
+    req.body.tp!=null ||
+    req.body.tps!=null
+  ) {
     it.metrics.targets = parseTargets(
       req.body.targets ?? req.body.targetText ?? req.body.tp ?? req.body.tps
     );
@@ -536,11 +551,13 @@ app.patch('/ideas/:id', requireUser, async (req, res) => {
   evalStatus(it);
 
   await saveDB(db);
+
   const pub = ideaPublic(it, req.user);
   sseSend('idea:update', pub);
   ok(res, { item: pub });
 });
 
+// delete idea
 app.delete('/ideas/:id', requireUser, async (req, res) => {
   const db = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
@@ -548,6 +565,7 @@ app.delete('/ideas/:id', requireUser, async (req, res) => {
 
   const it = db.ideas[idx];
 
+  // only author or admin
   if (!(req.user.role === 'admin' || it.authorId === req.user.id)) {
     return err(res, 403, 'Forbidden');
   }
@@ -585,6 +603,7 @@ async function likeHandler(req, res) {
     delete it.likes.by[userId];
   }
 
+  // recount
   it.likes.count = Object.keys(it.likes.by).length;
 
   await saveDB(db);
@@ -604,10 +623,10 @@ async function likeHandler(req, res) {
   });
 }
 
-app.put('/ideas/:id/likes',        requireUser, likeHandler);
-app.post('/ideas/:id/likes',       requireUser, likeHandler);
+app.put('/ideas/:id/likes', requireUser, likeHandler);
+app.post('/ideas/:id/likes', requireUser, likeHandler);
 app.put('/ideas/:id/likes/toggle', requireUser, likeHandler);
-app.post('/ideas/:id/likes/toggle',requireUser, likeHandler);
+app.post('/ideas/:id/likes/toggle', requireUser, likeHandler);
 
 /* -------------------- COMMENTS -------------------- */
 async function _commentAdd(req, res) {
@@ -620,8 +639,8 @@ async function _commentAdd(req, res) {
 
   const c = {
     id: uid(10),
-    authorId:    String(req.user?.id || ''),
-    authorName:  String(req.user?.name || 'Member'),
+    authorId: String(req.user?.id || ''),
+    authorName: String(req.user?.name || 'Member'),
     authorEmail: String(req.user?.email || ''),
     text,
     createdAt: nowISO(),
@@ -650,8 +669,9 @@ async function _commentEdit(req, res) {
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
-  const c = (it.comments?.items || [])
-    .find(x => String(x.id) === String(req.params.cid));
+  const c = (it.comments?.items || []).find(
+    x => String(x.id) === String(req.params.cid)
+  );
   if (!c) return err(res, 404, 'comment not found');
 
   // only comment author or admin
@@ -684,19 +704,24 @@ async function _commentDelete(req, res) {
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
-  const arr = it.comments?.items || [];
-  const idx = arr.findIndex(x => String(x.id) === String(req.params.cid));
+  const items = it.comments?.items || [];
+  const idx = items.findIndex(
+    x => String(x.id) === String(req.params.cid)
+  );
   if (idx < 0) return err(res, 404, 'comment not found');
 
-  const c = arr[idx];
+  const c = items[idx];
+
+  // only comment author or admin
   if (!(req.user.role === 'admin' || c.authorId === req.user.id)) {
     return err(res, 403, 'Forbidden');
   }
 
-  arr.splice(idx, 1);
+  items.splice(idx, 1);
+
   await saveDB(db);
 
-  const items = it.comments.items.map(x => ({
+  const outItems = it.comments.items.map(x => ({
     id: x.id,
     authorName: x.authorName,
     text: x.text,
@@ -704,21 +729,22 @@ async function _commentDelete(req, res) {
     updatedAt: x.updatedAt
   }));
 
-  sseSend('comments:update', { id: it.id, items });
-  ok(res, { items });
+  sseSend('comments:update', { id: it.id, items: outItems });
+  ok(res, { items: outItems });
 }
 
-app.post('/ideas/:id/comments',           requireUser, _commentAdd);
-app.patch('/ideas/:id/comments/:cid',     requireUser, _commentEdit);
-app.delete('/ideas/:id/comments/:cid',    requireUser, _commentDelete);
+app.post('/ideas/:id/comments', requireUser, _commentAdd);
+app.patch('/ideas/:id/comments/:cid', requireUser, _commentEdit);
+app.delete('/ideas/:id/comments/:cid', requireUser, _commentDelete);
 
 /* --------------------- EMAIL CORE ----------------- */
+// mailer helpers (only defined ONCE)
+
 function smtpReady() {
   return !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true));
 }
 
 let transporter = null;
-
 function getTransporter() {
   if (!smtpReady()) return null;
   if (transporter) return transporter;
@@ -738,8 +764,8 @@ function getTransporter() {
 
 function fromHeader() {
   if (EMAIL_FROM_INLINE) return EMAIL_FROM_INLINE;
-  if (MAIL_FROM)        return `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`;
-  if (SMTP_USER)        return `"${MAIL_FROM_NAME}" <${SMTP_USER}>`;
+  if (MAIL_FROM)         return `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`;
+  if (SMTP_USER)         return `"${MAIL_FROM_NAME}" <${SMTP_USER}>`;
   return `"${MAIL_FROM_NAME}" <no-reply@localhost>`;
 }
 
@@ -752,9 +778,17 @@ function splitEmails(list) {
 }
 
 function packToBcc(all) {
-  const u = uniq(all);
-  if (u.length <= 1) return { to: u[0] || undefined, bcc: undefined };
-  return { to: u[0], bcc: u.slice(1) };
+  const uniqd = uniq(all);
+  if (uniqd.length <= 1) {
+    return {
+      to: uniqd[0] || undefined,
+      bcc: undefined
+    };
+  }
+  return {
+    to:  uniqd[0],
+    bcc: uniqd.slice(1)
+  };
 }
 
 function _esc(s) {
@@ -772,8 +806,11 @@ function _bullets(s) {
     .filter(Boolean);
 
   if (!parts.length) return '';
+
   return `<ul style="margin:8px 0 0 20px;padding:0">
-    ${parts.map(li => `<li style="margin:6px 0;line-height:1.45">${_esc(li)}</li>`).join('')}
+    ${parts.map(li => `
+      <li style="margin:6px 0;line-height:1.45">${_esc(li)}</li>`
+    ).join('')}
   </ul>`;
 }
 
@@ -791,14 +828,15 @@ function _emailShell({
   statusColor
 }) {
   const isClear = ['clear','transparent','none','minimal','white'].includes(theme);
-  const logo    = absUrl(LOGO_URL);
-  const brand   = MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
-  const hasImg  = !!imgUrl;
+  const logo = absUrl(LOGO_URL);
+  const brand = MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
+  const hasImg = !!imgUrl;
 
   const bodyBg     = isClear ? '' : 'background:#0a0f1a;';
   const container  = isClear
     ? 'background:transparent;border:none;box-shadow:none;'
     : 'background:#0b1220;border:1px solid rgba(255,255,255,0.06);box-shadow:0 6px 28px rgba(0,0,0,0.35);';
+  const headGrad   = isClear ? '' : 'background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0));';
   const textColor  = isClear ? '#0b1220' : '#e8eefc';
   const titleColor = isClear ? '#0b1220' : '#f5f8ff';
   const badgeBg    = isClear ? 'rgba(0,0,0,0.05)' : 'rgba(255,255,255,0.06)';
@@ -808,23 +846,32 @@ function _emailShell({
     ? `<span style="display:inline-block;width:10px;height:10px;border-radius:999px;margin-right:8px;vertical-align:middle;background:${statusColor}"></span>`
     : '';
 
+  // if caller didn't give explicit CTA, fallback to dashboard base
+  const finalCtaHref = ctaHref || ideaDeepLink({ id:'', symbol:'', title });
+
   return `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${_esc(title)}</title></head>
 <body style="margin:0;padding:0;${bodyBg}">
   <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent">${_esc(preheader || title)}</div>
+
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="${isClear ? '' : 'background:#0a0f1a;'}padding:24px 14px">
     <tr><td align="center">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:680px;${container}border-radius:18px;overflow:hidden">
-        <tr><td align="center" style="padding:22px 20px 8px 20px;">
+
+        <tr><td align="center" style="padding:22px 20px 8px 20px;${headGrad}">
           <a href="${_esc(SITE_URL)}" style="text-decoration:none;display:inline-block" target="_blank" rel="noopener">
-            <img src="${_esc(logo)}" alt="${_esc(brand)}" width="220" style="display:block;width:220px;max-width:220px;height:auto;">
+            <img src="${_esc(logo)}" alt="${_esc(brand)}" width="220"
+                 style="display:block;width:220px;max-width:220px;height:auto;">
           </a>
+
           ${badgeText ? `
           <div style="margin:14px auto 0 auto;display:inline-block;padding:6px 12px;border-radius:999px;
                       background:${badgeBg};color:${badgeColor};font-weight:700;font-size:12px;letter-spacing:.35px;text-transform:uppercase;">
             ${dot}${_esc(badgeText)}
           </div>` : ''}
+
         </td></tr>
 
         ${hasImg ? `
@@ -835,37 +882,71 @@ function _emailShell({
         </td></tr>` : ''}
 
         <tr><td style="padding:18px 20px 8px 20px;color:${textColor};font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;">
-          <h1 style="margin:0 0 8px 0;font-size:22px;line-height:1.3;color:${titleColor};font-weight:800;">${_esc(title)}</h1>
-          ${symbol ? `<div style="margin:2px 0 10px 0"><span style="display:inline-block;background:#0fd5ff12;color:#9be8ff;border:1px solid #0fd5ff38;padding:6px 10px;border-radius:999px;font-weight:700;font-size:12px;letter-spacing:.2px;">${_esc(symbol)}</span></div>` : ''}
+          <h1 style="margin:0 0 8px 0;font-size:22px;line-height:1.3;color:${titleColor};font-weight:800;">
+            ${_esc(title)}
+          </h1>
+
+          ${symbol ? `
+          <div style="margin:2px 0 10px 0">
+            <span style="display:inline-block;background:#0fd5ff12;color:#9be8ff;border:1px solid #0fd5ff38;
+                         padding:6px 10px;border-radius:999px;font-weight:700;font-size:12px;letter-spacing:.2px;">
+              ${_esc(symbol)}
+            </span>
+          </div>` : ''}
 
           ${levelsHTML ? `
-            <div style="margin:12px 0 10px 0;padding:12px 14px;border-radius:12px;background:rgba(255,255,255,0.03);border:1px dashed rgba(255,255,255,0.08);">
-              <div style="font-size:12px;color:#99a6c7;letter-spacing:.3px;text-transform:uppercase;font-weight:700;margin-bottom:6px">Levels</div>
+            <div style="margin:12px 0 10px 0;padding:12px 14px;border-radius:12px;
+                        background:rgba(255,255,255,0.03);border:1px dashed rgba(255,255,255,0.08);">
+              <div style="font-size:12px;color:#99a6c7;letter-spacing:.3px;text-transform:uppercase;
+                          font-weight:700;margin-bottom:6px">
+                Levels
+              </div>
               ${levelsHTML}
             </div>` : ''}
 
           ${planHTML ? `
             <div style="margin:12px 0 0 0;">
-              <div style="font-size:12px;color:#99a6c7;letter-spacing:.3px;text-transform:uppercase;font-weight:700;margin-bottom:6px">Plan</div>
+              <div style="font-size:12px;color:#99a6c7;letter-spacing:.3px;text-transform:uppercase;
+                          font-weight:700;margin-bottom:6px">
+                Plan
+              </div>
               ${planHTML}
             </div>` : ''}
+
         </td></tr>
 
         <tr><td align="left" style="padding:8px 20px 24px 20px">
           <table role="presentation" cellpadding="0" cellspacing="0"><tr>
-            <td><a href="${_esc(ideaDeepLink({ id:'', symbol:'', title:title }))}"
-                   style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;text-decoration:none;border-radius:999px;font-weight:900;font-size:14px"
-                   target="_blank" rel="noopener">${_esc(ctaText || 'Open on Dashboard')}</a></td>
+
+            <td>
+              <a href="${_esc(finalCtaHref)}"
+                 style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;
+                        text-decoration:none;border-radius:999px;font-weight:900;font-size:14px"
+                 target="_blank" rel="noopener">
+                ${_esc(ctaText || 'Open on Dashboard')}
+              </a>
+            </td>
+
             <td width="12"></td>
-            <td><a href="${_esc(SITE_URL)}"
-                   style="display:inline-block;padding:12px 16px;background:transparent;color:#cfe8ff;text-decoration:none;border-radius:999px;font-weight:700;font-size:14px;border:1px solid rgba(255,255,255,0.14)"
-                   target="_blank" rel="noopener">Visit Site</a></td>
+
+            <td>
+              <a href="${_esc(SITE_URL)}"
+                 style="display:inline-block;padding:12px 16px;background:transparent;color:#cfe8ff;
+                        text-decoration:none;border-radius:999px;font-weight:700;font-size:14px;
+                        border:1px solid rgba(255,255,255,0.14)"
+                 target="_blank" rel="noopener">
+                Visit Site
+              </a>
+            </td>
+
           </tr></table>
         </td></tr>
 
-        <tr><td style="padding:14px 20px 20px 20px;color:#8fa0c6;font-size:12px;border-top:1px solid rgba(255,255,255,0.06);">
+        <tr><td style="padding:14px 20px 20px 20px;color:#8fa0c6;font-size:12px;
+                        border-top:1px solid rgba(255,255,255,0.06);">
           <div>You’re receiving this update from ${_esc(MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros')}.</div>
         </td></tr>
+
       </table>
     </td></tr>
   </table>
@@ -878,7 +959,7 @@ function emailTemplatePost(item) {
   const levels  = _bullets(item?.levelText || item?.levels || '');
   const plan    = _bullets(item?.take || item?.content || '');
   const imgUrl  = firstImageUrl(item);
-  const deepURL = ideaDeepLink(item); // may be used later if you want CTA direct to this idea
+  const deepURL = ideaDeepLink(item);
   const pre     = `${symbol ? symbol + ' • ' : ''}${title}`;
 
   return _emailShell({
@@ -895,22 +976,22 @@ function emailTemplatePost(item) {
   });
 }
 
-/* ---------------- EMAIL SEND HELPERS ------------- */
+/* ---------------------- EMAIL SEND HELPERS ------- */
 async function recipientsFor(reqBody){
-  // force override list from env
+  // 1. override all -> EMAIL_FORCE_ALL_TO
   const forced = splitEmails(EMAIL_FORCE_ALL_TO);
-  if (forced.length) return { list: forced, mode:'forced' };
+  if (forced.length) {
+    return { list: forced, mode:'forced' };
+  }
 
-  // subscribers file
-  const subs = await (async ()=>{
-    try {
+  // 2. subscribers list on disk
+  const subs = await (async()=>{
+    try{
       const raw = await fsp.readFile(SUBS_FILE,'utf8').catch(()=> '');
-      if (!raw) return { subs:[] };
+      if(!raw) return {subs:[]};
       const j = JSON.parse(raw);
-      return j || { subs:[] };
-    } catch {
-      return { subs:[] };
-    }
+      return j || {subs:[]};
+    } catch { return {subs:[]}; }
   })();
 
   const list = uniq(
@@ -918,18 +999,20 @@ async function recipientsFor(reqBody){
       .map(s => String(s.email||'').toLowerCase())
       .filter(e => EMAIL_RX.test(e))
   );
+  if (list.length) {
+    return { list, mode:'subs' };
+  }
 
-  if (list.length) return { list, mode:'subs' };
+  // 3. fallback: actor email
+  const actorEmail = String(
+    reqBody?.actor?.email || reqBody?.actorEmail || ''
+  ).trim().toLowerCase();
 
-  // fallback: actor email
-  const actorEmail = String(reqBody?.actor?.email || reqBody?.actorEmail || '')
-    .trim()
-    .toLowerCase();
   if (EMAIL_RX.test(actorEmail)) {
     return { list:[actorEmail], mode:'actor' };
   }
 
-  // last fallback: admins
+  // 4. fallback: admins / BCC
   const admins = (EMAIL_BCC_ADMIN || []).filter(e => EMAIL_RX.test(e));
   return admins.length
     ? { list: admins, mode:'admin' }
@@ -937,14 +1020,15 @@ async function recipientsFor(reqBody){
 }
 
 async function sendEmailBlast({ subject, html, toList }){
-  // 1) Try SMTP (nodemailer)
-  try {
+  // First try SMTP
+  try{
     const tx = getTransporter();
     if (tx && toList.length){
       const from    = fromHeader();
       const replyTo = EMAIL_REPLY_TO || undefined;
       const adminBcc = EMAIL_BCC_ADMIN;
       const { to, bcc } = packToBcc(toList);
+
       const finalBcc = uniq([...(bcc || []), ...adminBcc]);
 
       const info = await tx.sendMail({
@@ -966,17 +1050,26 @@ async function sendEmailBlast({ subject, html, toList }){
     console.warn('[email][smtp] failed, trying HTTP fallback:', e?.message || e);
   }
 
-  // 2) Fallback: Mailjet-style HTTP call using SMTP_USER/SMTP_PASS
-  if (!(SMTP_USER && SMTP_PASS)) throw new Error('No SMTP creds for HTTP fallback');
-  if (!toList.length) return { sent:0, via:'http' };
+  // If no SMTP creds or sendMail fails, try Mailjet-compatible HTTP fallback.
+  if (!(SMTP_USER && SMTP_PASS)) {
+    throw new Error('No SMTP creds for HTTP fallback');
+  }
+  if (!toList.length) {
+    return { sent:0, via:'http' };
+  }
 
   const payload = {
     Messages: [{
-      From: { Email: (MAIL_FROM || SMTP_USER), Name: MAIL_FROM_NAME || 'Notifier' },
+      From: {
+        Email: (MAIL_FROM || SMTP_USER),
+        Name: MAIL_FROM_NAME || 'Notifier'
+      },
       To: toList.map(e => ({ Email: e })),
       Subject: subject,
       HTMLPart: html,
-      Headers: EMAIL_REPLY_TO ? { 'Reply-To': EMAIL_REPLY_TO } : undefined
+      Headers: EMAIL_REPLY_TO
+        ? { 'Reply-To': EMAIL_REPLY_TO }
+        : undefined
     }]
   };
 
@@ -996,8 +1089,8 @@ async function sendEmailBlast({ subject, html, toList }){
       timeout: 12000
     }, res=>{
       let data='';
-      res.on('data', c => data+=c);
-      res.on('end', () => {
+      res.on('data', c=> data+=c);
+      res.on('end', ()=>{
         if (res.statusCode >= 200 && res.statusCode < 300) {
           resolve({ ok:true, status: res.statusCode, body: data });
         } else {
@@ -1005,16 +1098,22 @@ async function sendEmailBlast({ subject, html, toList }){
         }
       });
     });
-    req.on('timeout', ()=>{ req.destroy(new Error('Mailjet HTTP timeout')); });
+    req.on('timeout', ()=>{
+      req.destroy(new Error('Mailjet HTTP timeout'));
+    });
     req.on('error', reject);
     req.write(body);
     req.end();
   });
 
-  return { sent: toList.length, via: 'http', raw: httpResult.status };
+  return {
+    sent: toList.length,
+    via:'http',
+    raw: httpResult.status
+  };
 }
 
-/* ---------------------- EMAIL ROUTE -------------- */
+/* ---------------------- EMAIL ROUTES ------------- */
 app.post('/email/post', requireAdmin, async (req, res) => {
   try{
     const item = req.body?.item || req.body?.data || null;
@@ -1031,11 +1130,15 @@ app.post('/email/post', requireAdmin, async (req, res) => {
 
     const subject = `🔔 New Idea: ${
       item.symbol ? `${item.symbol} — ` : ''
-    }${item.title||'Update'}`;
+    }${item.title || 'Update'}`;
 
     const html = emailTemplatePost(item);
 
-    const result = await sendEmailBlast({ subject, html, toList:list });
+    const result = await sendEmailBlast({
+      subject,
+      html,
+      toList:list
+    });
 
     ok(res, {
       ok:true,
@@ -1050,11 +1153,11 @@ app.post('/email/post', requireAdmin, async (req, res) => {
 
 /* ---------------------- PRICE PING ---------------- */
 app.post('/price/ping', requireAdmin, async (_req, res) => {
-  // stub / keep your old live price update logic here if you had it
+  // You can drop in your previous live price tracking logic here if you had it.
   ok(res, { ok:true });
 });
 
-/* ----------------------- SUBSCRIBE --------------- */
+/* ----------------------- SUBSCRIBERS -------------- */
 app.post('/subscribe', requireUser, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const name  = String(req.body?.name || req.user?.name || 'Member').trim();
@@ -1063,18 +1166,18 @@ app.post('/subscribe', requireUser, async (req, res) => {
     return err(res, 400, 'Valid email required');
   }
 
-  const subs = await (async()=>{
-    try {
+  const s = await (async()=>{
+    try{
       const raw = await fsp.readFile(SUBS_FILE,'utf8').catch(()=> '');
-      return raw ? JSON.parse(raw) : { subs:[] };
+      return raw ? JSON.parse(raw) : {subs:[]};
     } catch {
       return { subs:[] };
     }
   })();
 
-  const exists = (subs.subs || []).find(x => x.email === email);
+  const exists = (s.subs || []).find(x => x.email === email);
   if (!exists) {
-    (subs.subs ||= []).push({
+    (s.subs ||= []).push({
       email,
       name,
       createdAt: nowISO(),
@@ -1083,25 +1186,29 @@ app.post('/subscribe', requireUser, async (req, res) => {
   }
 
   await ensureDir(DATA_DIR);
-  await fsp.writeFile(SUBS_FILE, JSON.stringify(subs,null,2),'utf8');
+  await fsp.writeFile(
+    SUBS_FILE,
+    JSON.stringify(s,null,2),
+    'utf8'
+  );
 
   ok(res, { ok:true });
 });
 
 /* ----------------------- UPLOAD ------------------- */
 let upload;
-
 function buildMulter() {
   upload = multer({
     storage: multer.diskStorage({
       destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
       filename: (_req, file, cb) => {
-        const ext = ({
-          'image/png' : '.png',
+        const extMap = {
+          'image/png':  '.png',
           'image/jpeg': '.jpg',
           'image/webp': '.webp',
-          'image/gif' : '.gif'
-        }[file.mimetype]) || '';
+          'image/gif':  '.gif'
+        };
+        const ext = extMap[file.mimetype] || '';
         cb(null, `${Date.now()}_${uid(8)}${ext}`);
       }
     }),
@@ -1133,9 +1240,9 @@ async function start() {
   buildMulter();
 
   app.listen(PORT, () => {
-    console.log(`Email: /email/post`);
+    console.log('Email: /email/post  Debug: /debug/email/status (removed)');
     console.log(`[tcpp-ideas-backend] listening on :${PORT} env=${NODE_ENV} data=${DATA_FILE}`);
-    console.log(`SSE: /events  CRUD: /ideas  Latest: /ideas/latest  Upload: /upload`);
+    console.log(`SSE: /events  CRUD: /ideas  Latest: /ideas/latest  Upload: /upload  Price: /price/ping`);
   });
 }
 
