@@ -1,3 +1,14 @@
+/* server.cjs
+ * TCPP Ideas Backend — ideas + uploads + likes + comments
+ * + live status engine (EL/SL/TPs) + stop/target email triggers
+ *
+ * This version:
+ * - CommonJS, no ESM imports
+ * - Removes nanoid package (which was ESM-only)
+ * - Uses internal nanoid() implemented with crypto
+ * - CORS allowlist + referer allowlist for /price/ping
+ */
+
 'use strict';
 
 const path = require('path');
@@ -8,22 +19,22 @@ const cors = require('cors');
 const multer = require('multer');
 const nodemailer = require('nodemailer');
 const https = require('https');
-const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 
 /* ---------------------- ID HELPER ----------------- */
-function uid(size = 12) {
+/* generate short url-safe IDs similar to nanoid */
+function nanoid(size = 12) {
+  // crypto.randomBytes(size) -> base64url string -> slice to length
   return crypto.randomBytes(size).toString('base64url').slice(0, size);
 }
 
 /* ---------------------- ENV ---------------------- */
-const PORT       = process.env.PORT || 8080;
-const NODE_ENV   = process.env.NODE_ENV || 'production';
+const PORT      = process.env.PORT || 8080;
+const NODE_ENV  = process.env.NODE_ENV || 'production';
 
-const API_TOKEN  = process.env.API_TOKEN  || '';
-const JWT_SECRET = process.env.JWT_SECRET || ''; // MUST match Wix secret "JWT_SECRET"
+const API_TOKEN = process.env.API_TOKEN || '';
 
-const _corsEnv   = process.env.CORS_ORIGINS || process.env.CORS_ALLOW_ORIGINS || '*';
+const _corsEnv  = process.env.CORS_ORIGINS || process.env.CORS_ALLOW_ORIGINS || '*';
 const CORS_ORIGINS = _corsEnv.split(',').map(s => s.trim()).filter(Boolean);
 
 const DATA_DIR    = process.env.DATA_DIR   || '/data';
@@ -35,12 +46,12 @@ const UPLOADS_PUBLIC_BASE_URL = (process.env.UPLOADS_PUBLIC_BASE_URL || '').repl
 
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 8);
 const ALLOWED_UPLOAD_TYPES = (process.env.ALLOWED_UPLOAD_TYPES
-  || 'image/png,image/jpeg,image/webp,image/gif')
-  .split(',')
-  .map(s => s.trim());
+  || 'image/png,image/jpeg,image/webp,image/gif').split(',').map(s => s.trim());
 
-/* allowlist for /price/ping (TradingView etc)
-   comma-separated: "tradingview.com,*.tradingview.com"
+const PRICE_STALE_SEC = Number(process.env.PRICE_STALE_SEC || 900);
+
+/* allowlist for /price/ping source (TradingView etc)
+   comma-separated list like: "tradingview.com,*.tradingview.com"
 */
 const ALLOW_FETCH_REFERERS = (process.env.ALLOW_FETCH_REFERERS || '')
   .split(',')
@@ -56,13 +67,11 @@ const SMTP_PASS   = process.env.SMTP_PASS   || '';
 
 const MAIL_FROM         = process.env.MAIL_FROM || '';
 const MAIL_FROM_NAME    = process.env.MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
-const EMAIL_FROM_INLINE = process.env.EMAIL_FROM || ''; // inline "Name <email>"
+const EMAIL_FROM        = process.env.EMAIL_FROM || ''; // inline "Name <email>"
 const EMAIL_REPLY_TO    = (process.env.EMAIL_REPLY_TO || '').trim();
 
 const EMAIL_BCC_ADMIN   = (process.env.EMAIL_BCC_ADMIN || '')
-  .split(',')
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 const EMAIL_FORCE_ALL_TO = (process.env.EMAIL_FORCE_ALL_TO || '').trim().toLowerCase();
 
@@ -74,6 +83,8 @@ const LOGO_URL    = process.env.EMAIL_LOGO_URL
 
 const ASSET_BASE_URL = process.env.ASSET_BASE_URL || SITE_URL;
 const EMAIL_THEME    = (process.env.EMAIL_THEME || 'dark').toLowerCase();
+const EMAIL_LAYOUT   = (process.env.EMAIL_LAYOUT || 'hero-first').toLowerCase();
+const EMAIL_BODY_BG  = process.env.EMAIL_BODY_BG || '';
 
 /* ---------------------- UTIL ---------------------- */
 const nowISO = () => new Date().toISOString();
@@ -123,9 +134,7 @@ async function loadDB() {
     if (!raw) return blankDB();
     const j = JSON.parse(raw);
     return (j && Array.isArray(j.ideas)) ? j : blankDB();
-  } catch {
-    return blankDB();
-  }
+  } catch { return blankDB(); }
 }
 async function saveDB(db) {
   await ensureDir(DATA_DIR);
@@ -141,9 +150,7 @@ async function loadSubs() {
     if (!raw) return blankSubs();
     const j = JSON.parse(raw);
     return (j && Array.isArray(j.subs)) ? j : blankSubs();
-  } catch {
-    return blankSubs();
-  }
+  } catch { return blankSubs(); }
 }
 async function saveSubs(db) {
   await ensureDir(DATA_DIR);
@@ -165,7 +172,7 @@ function buildMulter() {
           'image/webp': '.webp',
           'image/gif': '.gif'
         }[file.mimetype]) || '';
-        cb(null, `${Date.now()}_${uid(8)}${ext}`);
+        cb(null, `${Date.now()}_${nanoid(8)}${ext}`);
       }
     }),
     fileFilter: (_req, file, cb) => {
@@ -185,75 +192,32 @@ function readBearer(req) {
 function readQueryToken(req) {
   return (req.query && String(req.query.token || '').trim()) || '';
 }
-
-// Decode token as either:
-// - API_TOKEN (admin-only static token)
-// - JWT from Wix (user or admin)
-function decodeUser(token){
-  if (!token) return null;
-
-  // static server token => force admin
-  if (API_TOKEN && token === API_TOKEN) {
-    return {
-      id:    'admin',
-      name:  'Admin',
-      email: 'admin@local',
-      role:  'admin',
-      via:   'api-token'
-    };
-  }
-
-  // wix jwt
-  if (JWT_SECRET) {
-    try {
-      const p = jwt.verify(token, JWT_SECRET);
-      const role = (p.role === 'admin') ? 'admin' : 'user';
-      return {
-        id:    String(p.sub || p.id || p.userId || uid()).slice(0,120),
-        name:  String(p.name || 'Member').slice(0,120),
-        email: String(p.email || '').toLowerCase(),
-        role,
-        via:   'jwt'
-      };
-    } catch (_) {}
-  }
-
-  return null;
-}
-
-function readUser(req){
+function requireAuth(req, res, next) {
+  if (!API_TOKEN) return next(); // if no token set, open (dev mode)
   const tok = readBearer(req) || readQueryToken(req);
-  return decodeUser(tok);
-}
-
-function requireUser(req, res, next){
-  const u = readUser(req);
-  if (!u) return err(res, 401, 'Unauthorized');
-  req.user = u;
+  if (tok !== API_TOKEN) return err(res, 401, 'Unauthorized');
   next();
 }
-function requireAdmin(req, res, next){
-  const u = readUser(req);
-  if (!u) return err(res, 401, 'Unauthorized');
-  if (u.role !== 'admin') return err(res, 403, 'Forbidden');
-  req.user = u;
-  next();
-}
-
 function sseAuthOK(req) {
-  // SSE uses ?token=
-  const t = readQueryToken(req);
-  if (!API_TOKEN && !JWT_SECRET) return true; // totally open if you haven't set secrets
-  return !!decodeUser(t);
+  if (!API_TOKEN) return true;
+  const tok = readQueryToken(req);
+  return tok === API_TOKEN;
 }
 
-/* ----------------- REFERER GUARD (price/ping) ---- */
+/* ----------------- REFERER GUARD ------------------
+   Used ONLY for /price/ping so TradingView etc can hit it,
+   and random strangers can't spam it.
+
+   ALLOW_FETCH_REFERERS can have plain hosts ("tradingview.com")
+   or wildcard ("*.tradingview.com").
+---------------------------------------------------*/
 function wildcardToRegex(pattern) {
   // escape regex chars, then turn "*" into ".*"
   let esc = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
   esc = esc.replace(/\\\*/g, '.*');
   return new RegExp('^' + esc + '$', 'i');
 }
+
 const ALLOWED_REF_REGEXES = ALLOW_FETCH_REFERERS.map(p => {
   try { return wildcardToRegex(p); } catch { return null; }
 }).filter(Boolean);
@@ -290,7 +254,7 @@ const clients = new Set(); // { id, res, ping }
 function sseSend(event, data) {
   const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const c of clients) {
-    try { c.res.write(line); } catch {}
+    try { c.res.write(line); } catch { /* ignore */ }
   }
 }
 function sseSendTo(res, event, data) {
@@ -302,24 +266,24 @@ const app = express();
 
 /* ----- CORS allow logic ----- */
 function isOriginAllowed(origin) {
-  if (!origin) return true; // curl, server-to-server
+  if (!origin) return true; // no Origin header -> allow (curl / server2server)
 
   if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return true;
 
   try {
     const { protocol, host } = new URL(origin);
 
-    // Wix site/editor preview
+    // wix editor/preview
     if (host.endsWith('.wixsite.com')) {
       return protocol === 'https:';
     }
 
-    // Wix CDN/media sandbox domains
+    // Wix CDN/media
     if (host.endsWith('.filesusr.com')) {
       return protocol === 'https:';
     }
 
-    // custom wildcard like https://*.mydomain.com
+    // wildcard like https://*.wixsite.com
     for (const pat of CORS_ORIGINS) {
       if (!pat.includes('*')) continue;
       const m = pat.match(/^https?:\/\/\*\.(.+)$/i);
@@ -336,11 +300,12 @@ function isOriginAllowed(origin) {
   return false;
 }
 
+/* CORS middleware */
 app.use(cors({
   origin: (origin, cb) => {
     const allowed = isOriginAllowed(origin);
     if (!allowed) {
-      console.error(`[CORS] blocked origin ${origin}`);
+      console.error(`CORS blocked: ${origin}`);
     }
     cb(null, allowed);
   },
@@ -355,7 +320,7 @@ app.use('/uploads', express.static(UPLOAD_DIR, {
   index: false,
   maxAge: '30d',
   setHeaders: res => {
-    // so Wix can embed images
+    // so images can be embedded on wix site etc
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   }
 }));
@@ -380,7 +345,7 @@ app.get('/events', (req, res) => {
 
   if (res.flushHeaders) res.flushHeaders();
 
-  const id = uid(10);
+  const id = nanoid(10);
   const client = { id, res, ping: null };
   clients.add(client);
 
@@ -419,7 +384,7 @@ function ideaDeepLink(item) {
   return `${base}${q}`;
 }
 
-function normalizeIdea(input, author /* {id,name,email} */) {
+function normalizeIdea(input) {
   const now = nowISO();
   const dir = normalizeDirection(input.direction || input.bias);
   const entry = nnum(input.entryLevel ?? input.entry ?? input.el);
@@ -427,7 +392,7 @@ function normalizeIdea(input, author /* {id,name,email} */) {
   const targets = parseTargets(input.targets ?? input.targetText ?? input.tps ?? input.tp);
 
   return {
-    id: input.id || uid(12),
+    id: input.id || nanoid(12),
     type: String(input.type || 'post'),
     status: String(input.status || 'live'),
     title: String(input.title || '').slice(0, 240),
@@ -452,9 +417,9 @@ function normalizeIdea(input, author /* {id,name,email} */) {
       hitTargetIndex: null,
       notified: { stop:false, targets: {} }
     },
-    authorId: String(author?.id || input.authorId || ''),
-    authorName: String(author?.name || input.authorName || 'Member'),
-    authorEmail: String(author?.email || input.authorEmail || ''),
+    authorId: String(input.authorId || ''),
+    authorName: String(input.authorName || 'Member'),
+    authorEmail: String(input.authorEmail || ''),
     likes: input.likes || { count: 0, by: {} },
     comments: input.comments || { items: [] },
     createdAt: input.createdAt || now,
@@ -462,7 +427,7 @@ function normalizeIdea(input, author /* {id,name,email} */) {
   };
 }
 
-function ideaPublic(it, you){
+function ideaPublic(it) {
   return {
     id: it.id,
     type: it.type,
@@ -502,8 +467,7 @@ function ideaPublic(it, you){
         createdAt: c.createdAt,
         updatedAt: c.updatedAt
       }))
-    },
-    youLike: you ? !!(it.likes?.by?.[you.id] || it.likes?.by?.[you.email]) : undefined
+    }
   };
 }
 
@@ -561,46 +525,39 @@ function evalStatus(idea){
 /* -------------------- IDEAS CRUD ------------------ */
 app.get('/ideas/latest', async (req, res) => {
   const limit = Math.min(Number(req.query.limit || 30), 100);
-  const you   = readUser(req) || null;
-  const db    = await loadDB();
+  const db = await loadDB();
   const items = [...db.ideas]
     .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, limit)
-    .map(it => ideaPublic(it, you));
+    .map(ideaPublic);
   ok(res, { items, ideas: items });
 });
 
 app.get('/ideas/:id', async (req, res) => {
-  const you = readUser(req) || null;
-  const db  = await loadDB();
-  const it  = db.ideas.find(x => String(x.id) === String(req.params.id));
+  const db = await loadDB();
+  const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
-  ok(res, { item: ideaPublic(it, you) });
+  ok(res, { item: ideaPublic(it) });
 });
 
-app.post('/ideas', requireUser, async (req, res) => {
+app.post('/ideas', requireAuth, async (req, res) => {
   const db = await loadDB();
-  const it = normalizeIdea(req.body || {}, req.user);
+  const it = normalizeIdea(req.body || {});
   if (!it.imageUrl && Array.isArray(it.media) && it.media[0]?.url) {
     it.imageUrl = it.media[0].url;
   }
   db.ideas.unshift(it);
   await saveDB(db);
-  const pub = ideaPublic(it, req.user);
+  const pub = ideaPublic(it);
   sseSend('idea:new', pub);
   ok(res, { item: pub });
 });
 
-app.patch('/ideas/:id', requireUser, async (req, res) => {
-  const db  = await loadDB();
+app.patch('/ideas/:id', requireAuth, async (req, res) => {
+  const db = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
   if (idx < 0) return err(res, 404, 'Not found');
-  const it  = db.ideas[idx];
-
-  // only author or admin
-  if (!(req.user.role === 'admin' || it.authorId === req.user.id)) {
-    return err(res, 403, 'Forbidden');
-  }
+  const it = db.ideas[idx];
 
   Object.assign(it, {
     type:      req.body.type      ?? it.type,
@@ -627,22 +584,16 @@ app.patch('/ideas/:id', requireUser, async (req, res) => {
   evalStatus(it);
 
   await saveDB(db);
-  const pub = ideaPublic(it, req.user);
+  const pub = ideaPublic(it);
   sseSend('idea:update', pub);
   ok(res, { item: pub });
 });
 
-app.delete('/ideas/:id', requireUser, async (req, res) => {
-  const db  = await loadDB();
+app.delete('/ideas/:id', requireAuth, async (req, res) => {
+  const db = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
   if (idx < 0) return err(res, 404, 'Not found');
-  const it  = db.ideas[idx];
-
-  if (!(req.user.role === 'admin' || it.authorId === req.user.id)) {
-    return err(res, 403, 'Forbidden');
-  }
-
-  const id = it.id;
+  const id = db.ideas[idx].id;
   db.ideas.splice(idx, 1);
   await saveDB(db);
   sseSend('idea:delete', { id });
@@ -651,48 +602,42 @@ app.delete('/ideas/:id', requireUser, async (req, res) => {
 
 /* ---------------------- LIKES --------------------- */
 async function likeHandler(req, res) {
-  const action = String(req.body?.action || req.body?.op || '').toLowerCase();
+  const action      = String(req.body?.action || req.body?.op || '').toLowerCase();
+  const userId      = String(req.body?.userId || req.body?.by || '').slice(0, 120) || 'device';
+  const displayName = String(req.body?.displayName || req.body?.name || 'Member').slice(0, 120);
+
   if (!['like', 'unlike'].includes(action)) return err(res, 400, 'Invalid action');
 
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
-  const userId      = String(req.user?.id || req.user?.email || 'device');
-  const displayName = String(req.user?.name || 'Member');
-
   it.likes ||= { count: 0, by: {} };
   it.likes.by ||= {};
 
-  const was = !!(it.likes.by[userId] || it.likes.by[req.user?.email]);
-
+  const was = !!it.likes.by[userId];
   if (action === 'like' && !was) {
     it.likes.by[userId] = { at: nowISO(), name: displayName };
+    it.likes.count = Math.max(0, Number(it.likes.count || 0)) + 1;
   } else if (action === 'unlike' && was) {
     delete it.likes.by[userId];
+    it.likes.count = Math.max(0, Number(it.likes.count || 1) - 1);
   }
-  // recount
-  it.likes.count = Object.keys(it.likes.by).length;
 
   await saveDB(db);
 
-  const out = {
-    id: it.id,
-    likeCount: it.likes.count,
-    youLike: action === 'like'
-  };
+  const out = { id: it.id, likeCount: it.likes.count };
   sseSend('likes:update', out);
 
   ok(res, {
     likeCount: it.likes.count,
-    likes: { count: it.likes.count },
-    youLike: out.youLike
+    likes: { count: it.likes.count }
   });
 }
-app.put('/ideas/:id/likes', requireUser, likeHandler);
-app.post('/ideas/:id/likes', requireUser, likeHandler);
-app.put('/ideas/:id/likes/toggle', requireUser, likeHandler);
-app.post('/ideas/:id/likes/toggle', requireUser, likeHandler);
+app.put('/ideas/:id/likes', requireAuth, likeHandler);
+app.post('/ideas/:id/likes', requireAuth, likeHandler);
+app.put('/ideas/:id/likes/toggle', requireAuth, likeHandler);
+app.post('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 
 /* -------------------- COMMENTS -------------------- */
 async function _commentAdd(req, res) {
@@ -700,14 +645,16 @@ async function _commentAdd(req, res) {
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
-  const text = String(req.body?.text || '').trim();
+  const text       = String(req.body?.text || '').trim();
+  const authorId   = String(req.body?.authorId || '').slice(0, 120);
+  const authorName = String(req.body?.authorName || 'Member').slice(0, 120);
+
   if (!text) return err(res, 400, 'text required');
 
   const c = {
-    id: uid(10),
-    authorId: String(req.user?.id || ''),
-    authorName: String(req.user?.name || 'Member'),
-    authorEmail: String(req.user?.email || ''),
+    id: nanoid(10),
+    authorId,
+    authorName,
     text,
     createdAt: nowISO(),
     updatedAt: nowISO()
@@ -735,13 +682,9 @@ async function _commentEdit(req, res) {
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
-  const c = (it.comments?.items || []).find(x => String(x.id) === String(req.params.cid));
+  const c = (it.comments?.items || [])
+    .find(x => String(x.id) === String(req.params.cid));
   if (!c) return err(res, 404, 'comment not found');
-
-  // only the comment author or admin
-  if (!(req.user.role === 'admin' || c.authorId === req.user.id)) {
-    return err(res, 403, 'Forbidden');
-  }
 
   const text = String(req.body?.text || '').trim();
   if (!text) return err(res, 400, 'text required');
@@ -768,20 +711,16 @@ async function _commentDelete(req, res) {
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
-  const items = it.comments?.items || [];
-  const idx = items.findIndex(x => String(x.id) === String(req.params.cid));
-  if (idx < 0) return err(res, 404, 'comment not found');
+  const before = (it.comments?.items || []).length;
+  it.comments.items = (it.comments?.items || [])
+    .filter(x => String(x.id) !== String(req.params.cid));
+  const after = it.comments.items.length;
 
-  const c = items[idx];
-  if (!(req.user.role === 'admin' || c.authorId === req.user.id)) {
-    return err(res, 403, 'Forbidden');
-  }
-
-  items.splice(idx, 1);
+  if (before === after) return err(res, 404, 'comment not found');
 
   await saveDB(db);
 
-  const outItems = it.comments.items.map(x => ({
+  const items = it.comments.items.map(x => ({
     id: x.id,
     authorName: x.authorName,
     text: x.text,
@@ -789,12 +728,13 @@ async function _commentDelete(req, res) {
     updatedAt: x.updatedAt
   }));
 
-  sseSend('comments:update', { id: it.id, items: outItems });
-  ok(res, { items: outItems });
+  sseSend('comments:update', { id: it.id, items });
+  ok(res, { items });
 }
-app.post('/ideas/:id/comments', requireUser, _commentAdd);
-app.patch('/ideas/:id/comments/:cid', requireUser, _commentEdit);
-app.delete('/ideas/:id/comments/:cid', requireUser, _commentDelete);
+
+app.post('/ideas/:id/comments', requireAuth, _commentAdd);
+app.patch('/ideas/:id/comments/:cid', requireAuth, _commentEdit);
+app.delete('/ideas/:id/comments/:cid', requireAuth, _commentDelete);
 
 /* --------------------- EMAIL CORE ----------------- */
 function smtpReady() {
@@ -818,7 +758,7 @@ function getTransporter() {
 }
 
 function fromHeader() {
-  if (EMAIL_FROM_INLINE) return EMAIL_FROM_INLINE;
+  if (EMAIL_FROM) return EMAIL_FROM;
   if (MAIL_FROM) return `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`;
   if (SMTP_USER) return `"${MAIL_FROM_NAME}" <${SMTP_USER}>`;
   return `"${MAIL_FROM_NAME}" <no-reply@localhost>`;
@@ -1017,59 +957,39 @@ function emailTemplateStatus(item, kind /* 'stop' | 'target' */, info) {
 }
 
 async function recipientsFor(reqBody){
-  // 1. forced list (testing)
+  // 1. EMAIL_FORCE_ALL_TO overrides everything (great for testing)
   const forced = splitEmails(EMAIL_FORCE_ALL_TO);
   if (forced.length) return { list: forced, mode:'forced' };
 
-  // 2. subs file
+  // 2. active subscribers
   const subs = await loadSubs().catch(()=>blankSubs());
   const list = uniq((subs.subs||[])
     .map(s=>String(s.email||'').toLowerCase())
     .filter(e=>EMAIL_RX.test(e)));
   if (list.length) return { list, mode:'subs' };
 
-  // 3. whoever triggered
+  // 3. actor email (fallback for manual post)
   const actorEmail = String(reqBody?.actor?.email || reqBody?.actorEmail || '')
     .trim()
     .toLowerCase();
   if (EMAIL_RX.test(actorEmail)) return { list:[actorEmail], mode:'actor' };
 
-  // 4. admin emails
+  // 4. admin BCC only
   const admins = (EMAIL_BCC_ADMIN || []).filter(e => EMAIL_RX.test(e));
   return admins.length
     ? { list: admins, mode:'admin' }
     : { list: [], mode:'none' };
 }
 
-function smtpReady() {
-  return !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true));
-}
-let transporter = null;
-function getTransporter() {
+function getMailer(){
   if (!smtpReady()) return null;
-  if (transporter) return transporter;
-  transporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
-    auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-    connectionTimeout: 10000,
-    greetingTimeout: 10000,
-    socketTimeout: 15000
-  });
-  return transporter;
-}
-function fromHeader() {
-  if (EMAIL_FROM_INLINE) return EMAIL_FROM_INLINE;
-  if (MAIL_FROM) return `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`;
-  if (SMTP_USER) return `"${MAIL_FROM_NAME}" <${SMTP_USER}>`;
-  return `"${MAIL_FROM_NAME}" <no-reply@localhost>`;
+  return getTransporter();
 }
 
 async function sendEmailBlast({ subject, html, toList }){
-  // try SMTP first
+  // Try SMTP first
   try{
-    const tx = getTransporter();
+    const tx = getMailer();
     if (tx && toList.length){
       const from    = fromHeader();
       const replyTo = EMAIL_REPLY_TO || undefined;
@@ -1096,7 +1016,7 @@ async function sendEmailBlast({ subject, html, toList }){
     console.warn('[email][smtp] failed, trying HTTP fallback:', e?.message || e);
   }
 
-  // fallback: Mailjet via basic auth using SMTP creds
+  // Fallback: Mailjet REST API using SMTP_USER/SMTP_PASS
   if (!(SMTP_USER && SMTP_PASS)) throw new Error('No SMTP creds for HTTP fallback');
   if (!toList.length) return { sent:0, via:'http' };
 
@@ -1148,7 +1068,7 @@ async function sendEmailBlast({ subject, html, toList }){
 }
 
 /* ---------------------- EMAIL ROUTES ------------- */
-app.post('/email/post', requireAdmin, async (req, res) => {
+app.post('/email/post', requireAuth, async (req, res) => {
   try{
     const item = req.body?.item || req.body?.data || null;
     if (!item) return err(res, 400, 'item required');
@@ -1192,9 +1112,17 @@ async function maybeNotify(idea, reason /* 'stop' | 'target' */, info) {
 }
 
 /* ---------------------- PRICE PING ----------------
- * admin/bot endpoint to update live price + trigger status emails
- */
-app.post('/price/ping', checkReferer, requireAdmin, async (req, res) => {
+ * POST /price/ping
+ *  body: { symbol?: string, id?: string, price: number, at?: ISO }
+ *  - If id present -> update that idea
+ *  - else update ALL live ideas matching symbol
+ *  - Triggers SSE idea:status + idea:update
+ *  - Fires email once on stop/target hit
+ *
+ * We ALSO gate this route with checkReferer() so only approved
+ * referers/origins (tradingview etc.) can hit it in production.
+ ---------------------------------------------------*/
+app.post('/price/ping', checkReferer, requireAuth, async (req, res) => {
   const price  = nnum(req.body?.price);
   const at     = String(req.body?.at || nowISO());
   const symbol = String(req.body?.symbol || '').trim().toUpperCase();
@@ -1250,9 +1178,9 @@ app.post('/price/ping', checkReferer, requireAdmin, async (req, res) => {
     }
 
     it.updatedAt = nowISO();
-    touched.push(ideaPublic(it, null));
+    touched.push(ideaPublic(it));
 
-    // broadcast quick status
+    // Push SSE quick status
     sseSend('idea:status', {
       id: it.id,
       metrics: {
@@ -1265,8 +1193,8 @@ app.post('/price/ping', checkReferer, requireAdmin, async (req, res) => {
       }
     });
 
-    // broadcast full update
-    sseSend('idea:update', ideaPublic(it, null));
+    // And full update for listeners that only use idea:update
+    sseSend('idea:update', ideaPublic(it));
   };
 
   if (id) {
@@ -1312,15 +1240,9 @@ async function subscribeCore(email, name) {
   return { ok: true };
 }
 
-app.post('/subscribe', requireUser, async (req, res) => {
-  const email = String(
-    req.body?.email || (req.user?.email || '')
-  ).trim().toLowerCase();
-
-  const name  = String(
-    req.body?.name || req.user?.name || 'Member'
-  ).trim();
-
+app.post('/subscribe', requireAuth, async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const name  = String(req.body?.name || 'Member').trim();
   if (!email || !EMAIL_RX.test(email)) {
     return err(res, 400, 'Valid email required');
   }
@@ -1329,7 +1251,7 @@ app.post('/subscribe', requireUser, async (req, res) => {
 });
 
 /* ----------------------- UPLOAD ------------------- */
-app.post('/upload', requireUser, (req, res) => {
+app.post('/upload', requireAuth, (req, res) => {
   if (!upload) return err(res, 500, 'Upload not initialized');
   upload.single('file')(req, res, e => {
     if (e) return err(res, 400, e.message || 'Upload failed');
@@ -1340,7 +1262,7 @@ app.post('/upload', requireUser, (req, res) => {
 });
 
 /* ----------------------- DEBUG -------------------- */
-app.get('/debug/email/status', requireAdmin, (_req, res) => {
+app.get('/debug/email/status', requireAuth, (_req, res) => {
   ok(res, {
     smtp: {
       ready: !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true)),
@@ -1363,7 +1285,7 @@ app.get('/debug/email/status', requireAdmin, (_req, res) => {
   });
 });
 
-app.post('/debug/email/test', requireAdmin, async (req, res) => {
+app.post('/debug/email/test', requireAuth, async (req, res) => {
   try {
     const rawTo = req.query.to
       || req.body?.to
