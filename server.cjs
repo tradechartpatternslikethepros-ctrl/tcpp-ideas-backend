@@ -12,19 +12,18 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 
 /* ---------------------- ID HELPER ----------------- */
-/* generate short url-safe IDs similar to nanoid */
 function uid(size = 12) {
   return crypto.randomBytes(size).toString('base64url').slice(0, size);
 }
 
 /* ---------------------- ENV ---------------------- */
-const PORT      = process.env.PORT || 8080;
-const NODE_ENV  = process.env.NODE_ENV || 'production';
+const PORT       = process.env.PORT || 8080;
+const NODE_ENV   = process.env.NODE_ENV || 'production';
 
-const API_TOKEN = process.env.API_TOKEN || '';
-const JWT_SECRET= process.env.JWT_SECRET || ''; // must match Wix secret "JWT_SECRET"
+const API_TOKEN  = process.env.API_TOKEN  || '';
+const JWT_SECRET = process.env.JWT_SECRET || ''; // MUST match Wix secret "JWT_SECRET"
 
-const _corsEnv  = process.env.CORS_ORIGINS || process.env.CORS_ALLOW_ORIGINS || '*';
+const _corsEnv   = process.env.CORS_ORIGINS || process.env.CORS_ALLOW_ORIGINS || '*';
 const CORS_ORIGINS = _corsEnv.split(',').map(s => s.trim()).filter(Boolean);
 
 const DATA_DIR    = process.env.DATA_DIR   || '/data';
@@ -36,10 +35,12 @@ const UPLOADS_PUBLIC_BASE_URL = (process.env.UPLOADS_PUBLIC_BASE_URL || '').repl
 
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 8);
 const ALLOWED_UPLOAD_TYPES = (process.env.ALLOWED_UPLOAD_TYPES
-  || 'image/png,image/jpeg,image/webp,image/gif').split(',').map(s => s.trim());
+  || 'image/png,image/jpeg,image/webp,image/gif')
+  .split(',')
+  .map(s => s.trim());
 
-/* allowlist for /price/ping source (TradingView etc)
-   comma-separated list like: "tradingview.com,*.tradingview.com"
+/* allowlist for /price/ping (TradingView etc)
+   comma-separated: "tradingview.com,*.tradingview.com"
 */
 const ALLOW_FETCH_REFERERS = (process.env.ALLOW_FETCH_REFERERS || '')
   .split(',')
@@ -49,17 +50,19 @@ const ALLOW_FETCH_REFERERS = (process.env.ALLOW_FETCH_REFERERS || '')
 /* ---------------------- EMAIL -------------------- */
 const SMTP_HOST   = process.env.SMTP_HOST   || '';
 const SMTP_PORT   = Number(process.env.SMTP_PORT || 587);
-the const SMTP_SECURE = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || SMTP_PORT === 465;
+const SMTP_SECURE = String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || SMTP_PORT === 465;
 const SMTP_USER   = process.env.SMTP_USER   || '';
 const SMTP_PASS   = process.env.SMTP_PASS   || '';
 
 const MAIL_FROM         = process.env.MAIL_FROM || '';
 const MAIL_FROM_NAME    = process.env.MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
-const EMAIL_FROM_INLINE = process.env.EMAIL_FROM || ''; // optional inline "Name <email>"
+const EMAIL_FROM_INLINE = process.env.EMAIL_FROM || ''; // inline "Name <email>"
 const EMAIL_REPLY_TO    = (process.env.EMAIL_REPLY_TO || '').trim();
 
 const EMAIL_BCC_ADMIN   = (process.env.EMAIL_BCC_ADMIN || '')
-  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
 
 const EMAIL_FORCE_ALL_TO = (process.env.EMAIL_FORCE_ALL_TO || '').trim().toLowerCase();
 
@@ -120,7 +123,9 @@ async function loadDB() {
     if (!raw) return blankDB();
     const j = JSON.parse(raw);
     return (j && Array.isArray(j.ideas)) ? j : blankDB();
-  } catch { return blankDB(); }
+  } catch {
+    return blankDB();
+  }
 }
 async function saveDB(db) {
   await ensureDir(DATA_DIR);
@@ -136,7 +141,9 @@ async function loadSubs() {
     if (!raw) return blankSubs();
     const j = JSON.parse(raw);
     return (j && Array.isArray(j.subs)) ? j : blankSubs();
-  } catch { return blankSubs(); }
+  } catch {
+    return blankSubs();
+  }
 }
 async function saveSubs(db) {
   await ensureDir(DATA_DIR);
@@ -179,12 +186,13 @@ function readQueryToken(req) {
   return (req.query && String(req.query.token || '').trim()) || '';
 }
 
-// Decode either:
-// - static API_TOKEN (admin)
-// - signed JWT from Wix (user or admin)
+// Decode token as either:
+// - API_TOKEN (admin-only static token)
+// - JWT from Wix (user or admin)
 function decodeUser(token){
   if (!token) return null;
-  // Static token => admin
+
+  // static server token => force admin
   if (API_TOKEN && token === API_TOKEN) {
     return {
       id:    'admin',
@@ -194,7 +202,8 @@ function decodeUser(token){
       via:   'api-token'
     };
   }
-  // Signed JWT (from getIdeasAuth in Wix backend)
+
+  // wix jwt
   if (JWT_SECRET) {
     try {
       const p = jwt.verify(token, JWT_SECRET);
@@ -206,10 +215,9 @@ function decodeUser(token){
         role,
         via:   'jwt'
       };
-    } catch (_e) {
-      // invalid token
-    }
+    } catch (_) {}
   }
+
   return null;
 }
 
@@ -233,26 +241,19 @@ function requireAdmin(req, res, next){
 }
 
 function sseAuthOK(req) {
-  // SSE uses token=<...> in query
+  // SSE uses ?token=
   const t = readQueryToken(req);
-  if (!API_TOKEN && !JWT_SECRET) return true; // open if nothing configured
+  if (!API_TOKEN && !JWT_SECRET) return true; // totally open if you haven't set secrets
   return !!decodeUser(t);
 }
 
-/* ----------------- REFERER GUARD ------------------
-   Used ONLY for /price/ping so TradingView etc can hit it,
-   and random strangers can't spam it.
-
-   ALLOW_FETCH_REFERERS can have plain hosts ("tradingview.com")
-   or wildcard ("*.tradingview.com").
----------------------------------------------------*/
+/* ----------------- REFERER GUARD (price/ping) ---- */
 function wildcardToRegex(pattern) {
   // escape regex chars, then turn "*" into ".*"
   let esc = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
   esc = esc.replace(/\\\*/g, '.*');
   return new RegExp('^' + esc + '$', 'i');
 }
-
 const ALLOWED_REF_REGEXES = ALLOW_FETCH_REFERERS.map(p => {
   try { return wildcardToRegex(p); } catch { return null; }
 }).filter(Boolean);
@@ -289,7 +290,7 @@ const clients = new Set(); // { id, res, ping }
 function sseSend(event, data) {
   const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const c of clients) {
-    try { c.res.write(line); } catch { /* ignore */ }
+    try { c.res.write(line); } catch {}
   }
 }
 function sseSendTo(res, event, data) {
@@ -301,24 +302,24 @@ const app = express();
 
 /* ----- CORS allow logic ----- */
 function isOriginAllowed(origin) {
-  if (!origin) return true; // server-to-server or curl: allow
+  if (!origin) return true; // curl, server-to-server
 
   if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return true;
 
   try {
     const { protocol, host } = new URL(origin);
 
-    // Wix site/editor preview domains
+    // Wix site/editor preview
     if (host.endsWith('.wixsite.com')) {
       return protocol === 'https:';
     }
 
-    // Wix CDN/media
+    // Wix CDN/media sandbox domains
     if (host.endsWith('.filesusr.com')) {
       return protocol === 'https:';
     }
 
-    // wildcard entries like "https://*.wixsite.com"
+    // custom wildcard like https://*.mydomain.com
     for (const pat of CORS_ORIGINS) {
       if (!pat.includes('*')) continue;
       const m = pat.match(/^https?:\/\/\*\.(.+)$/i);
@@ -339,7 +340,7 @@ app.use(cors({
   origin: (origin, cb) => {
     const allowed = isOriginAllowed(origin);
     if (!allowed) {
-      console.error(`CORS blocked: ${origin}`);
+      console.error(`[CORS] blocked origin ${origin}`);
     }
     cb(null, allowed);
   },
@@ -354,7 +355,7 @@ app.use('/uploads', express.static(UPLOAD_DIR, {
   index: false,
   maxAge: '30d',
   setHeaders: res => {
-    // so images can be embedded on wix site etc
+    // so Wix can embed images
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   }
 }));
@@ -561,7 +562,7 @@ function evalStatus(idea){
 app.get('/ideas/latest', async (req, res) => {
   const limit = Math.min(Number(req.query.limit || 30), 100);
   const you   = readUser(req) || null;
-  const db = await loadDB();
+  const db    = await loadDB();
   const items = [...db.ideas]
     .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, limit)
@@ -571,8 +572,8 @@ app.get('/ideas/latest', async (req, res) => {
 
 app.get('/ideas/:id', async (req, res) => {
   const you = readUser(req) || null;
-  const db = await loadDB();
-  const it = db.ideas.find(x => String(x.id) === String(req.params.id));
+  const db  = await loadDB();
+  const it  = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
   ok(res, { item: ideaPublic(it, you) });
 });
@@ -591,10 +592,10 @@ app.post('/ideas', requireUser, async (req, res) => {
 });
 
 app.patch('/ideas/:id', requireUser, async (req, res) => {
-  const db = await loadDB();
+  const db  = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
   if (idx < 0) return err(res, 404, 'Not found');
-  const it = db.ideas[idx];
+  const it  = db.ideas[idx];
 
   // only author or admin
   if (!(req.user.role === 'admin' || it.authorId === req.user.id)) {
@@ -632,10 +633,10 @@ app.patch('/ideas/:id', requireUser, async (req, res) => {
 });
 
 app.delete('/ideas/:id', requireUser, async (req, res) => {
-  const db = await loadDB();
+  const db  = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
   if (idx < 0) return err(res, 404, 'Not found');
-  const it = db.ideas[idx];
+  const it  = db.ideas[idx];
 
   if (!(req.user.role === 'admin' || it.authorId === req.user.id)) {
     return err(res, 403, 'Forbidden');
@@ -657,11 +658,12 @@ async function likeHandler(req, res) {
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
-  const userId = String(req.user?.id || req.user?.email || 'device');
+  const userId      = String(req.user?.id || req.user?.email || 'device');
   const displayName = String(req.user?.name || 'Member');
 
   it.likes ||= { count: 0, by: {} };
   it.likes.by ||= {};
+
   const was = !!(it.likes.by[userId] || it.likes.by[req.user?.email]);
 
   if (action === 'like' && !was) {
@@ -732,10 +734,11 @@ async function _commentEdit(req, res) {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
+
   const c = (it.comments?.items || []).find(x => String(x.id) === String(req.params.cid));
   if (!c) return err(res, 404, 'comment not found');
 
-  // only comment author or admin
+  // only the comment author or admin
   if (!(req.user.role === 'admin' || c.authorId === req.user.id)) {
     return err(res, 403, 'Forbidden');
   }
@@ -1014,39 +1017,59 @@ function emailTemplateStatus(item, kind /* 'stop' | 'target' */, info) {
 }
 
 async function recipientsFor(reqBody){
-  // 1. EMAIL_FORCE_ALL_TO overrides everything (great for testing)
+  // 1. forced list (testing)
   const forced = splitEmails(EMAIL_FORCE_ALL_TO);
   if (forced.length) return { list: forced, mode:'forced' };
 
-  // 2. active subscribers
+  // 2. subs file
   const subs = await loadSubs().catch(()=>blankSubs());
   const list = uniq((subs.subs||[])
     .map(s=>String(s.email||'').toLowerCase())
     .filter(e=>EMAIL_RX.test(e)));
   if (list.length) return { list, mode:'subs' };
 
-  // 3. actor email (fallback for manual post)
+  // 3. whoever triggered
   const actorEmail = String(reqBody?.actor?.email || reqBody?.actorEmail || '')
     .trim()
     .toLowerCase();
   if (EMAIL_RX.test(actorEmail)) return { list:[actorEmail], mode:'actor' };
 
-  // 4. admin BCC only
+  // 4. admin emails
   const admins = (EMAIL_BCC_ADMIN || []).filter(e => EMAIL_RX.test(e));
   return admins.length
     ? { list: admins, mode:'admin' }
     : { list: [], mode:'none' };
 }
 
-function getMailer(){
+function smtpReady() {
+  return !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true));
+}
+let transporter = null;
+function getTransporter() {
   if (!smtpReady()) return null;
-  return getTransporter();
+  if (transporter) return transporter;
+  transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 15000
+  });
+  return transporter;
+}
+function fromHeader() {
+  if (EMAIL_FROM_INLINE) return EMAIL_FROM_INLINE;
+  if (MAIL_FROM) return `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`;
+  if (SMTP_USER) return `"${MAIL_FROM_NAME}" <${SMTP_USER}>`;
+  return `"${MAIL_FROM_NAME}" <no-reply@localhost>`;
 }
 
 async function sendEmailBlast({ subject, html, toList }){
-  // Try SMTP first
+  // try SMTP first
   try{
-    const tx = getMailer();
+    const tx = getTransporter();
     if (tx && toList.length){
       const from    = fromHeader();
       const replyTo = EMAIL_REPLY_TO || undefined;
@@ -1073,7 +1096,7 @@ async function sendEmailBlast({ subject, html, toList }){
     console.warn('[email][smtp] failed, trying HTTP fallback:', e?.message || e);
   }
 
-  // Fallback: Mailjet REST API using SMTP_USER/SMTP_PASS
+  // fallback: Mailjet via basic auth using SMTP creds
   if (!(SMTP_USER && SMTP_PASS)) throw new Error('No SMTP creds for HTTP fallback');
   if (!toList.length) return { sent:0, via:'http' };
 
@@ -1169,16 +1192,8 @@ async function maybeNotify(idea, reason /* 'stop' | 'target' */, info) {
 }
 
 /* ---------------------- PRICE PING ----------------
- * POST /price/ping  (admin / bot only)
- *  body: { symbol?: string, id?: string, price: number, at?: ISO }
- *  - If id present -> update that idea
- *  - else update ALL live ideas matching symbol
- *  - Triggers SSE idea:status + idea:update
- *  - Fires email once on stop/target hit
- *
- * We ALSO gate this route with checkReferer() so only approved
- * referers/origins (tradingview etc.) can hit it in production.
- ---------------------------------------------------*/
+ * admin/bot endpoint to update live price + trigger status emails
+ */
 app.post('/price/ping', checkReferer, requireAdmin, async (req, res) => {
   const price  = nnum(req.body?.price);
   const at     = String(req.body?.at || nowISO());
@@ -1237,7 +1252,7 @@ app.post('/price/ping', checkReferer, requireAdmin, async (req, res) => {
     it.updatedAt = nowISO();
     touched.push(ideaPublic(it, null));
 
-    // Push SSE quick status
+    // broadcast quick status
     sseSend('idea:status', {
       id: it.id,
       metrics: {
@@ -1250,7 +1265,7 @@ app.post('/price/ping', checkReferer, requireAdmin, async (req, res) => {
       }
     });
 
-    // And full update for listeners that only use idea:update
+    // broadcast full update
     sseSend('idea:update', ideaPublic(it, null));
   };
 
@@ -1298,8 +1313,14 @@ async function subscribeCore(email, name) {
 }
 
 app.post('/subscribe', requireUser, async (req, res) => {
-  const email = String(req.body?.email || (req.user?.email || '')).trim().toLowerCase();
-  const name  = String(req.body?.name || req.user?.name || 'Member').trim();
+  const email = String(
+    req.body?.email || (req.user?.email || '')
+  ).trim().toLowerCase();
+
+  const name  = String(
+    req.body?.name || req.user?.name || 'Member'
+  ).trim();
+
   if (!email || !EMAIL_RX.test(email)) {
     return err(res, 400, 'Valid email required');
   }
