@@ -16,9 +16,7 @@
 //   DELETE /ideas/:id/comments/:cid
 //   POST   /upload                        (auth, multipart/form-data `file`)
 //   POST   /email/post                    (auth, broadcast email alert)
-//   POST   /subscribe
-//   POST   /api/subscribe
-//   POST   /email/subscribe
+//   POST   /subscribe (/api/subscribe, /email/subscribe aliases)
 //   GET    /uploads/*                     (serves uploaded charts)
 //
 // Persistence:
@@ -224,15 +222,12 @@ function originAllowed(origin) {
   for (const ruleRaw of CORS_ALLOW) {
     const rule = ruleRaw.toLowerCase();
     if (rule.includes("*")) {
-      // convert like https://*.wixsite.com => ^https://.*\.wixsite\.com$
-      const re = new RegExp(
-        "^" +
-          rule
-            .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
-            .replace("\\*\\.", ".*\\.")
-            .replace("\\*", ".*") +
-          "$"
-      );
+      // turn "https://*.wixsite.com" into a regex
+      const safe = rule
+        .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+        .replace("\\*\\.", ".*\\.")
+        .replace("\\*", ".*");
+      const re = new RegExp("^" + safe + "$");
       if (re.test(low)) return true;
     } else {
       if (low === rule) return true;
@@ -241,29 +236,33 @@ function originAllowed(origin) {
   return false;
 }
 
-// soft referer checker (for /ideas/latest etc.)
+// SAFE referer checker (no regex crash).
+// We don't hard-block if not allowed — we just warn and continue.
+// This protects you from breaking prod just because of a funky pattern.
 function checkReferer(req, res, next) {
   if (!ALLOW_FETCH_REFERERS.length) return next();
+
   const ref = (req.get("Referer") || "").toLowerCase();
   if (!ref) return next();
-  const ok = ALLOW_FETCH_REFERERS.some((allowed) => {
-    if (allowed.includes("*")) {
-      const re = new RegExp(
-        "^" +
-          allowed
-            .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
-            .replace("\\*\\.", ".*\\.")
-            .replace("\\*", ".*") +
-          "$"
-      );
-      return re.test(ref);
+
+  const ok = ALLOW_FETCH_REFERERS.some((ruleRaw) => {
+    const rule = ruleRaw.toLowerCase();
+
+    // if rule has a wildcard, we just do substring check
+    //   "*.tradingview.com" -> "tradingview.com"
+    //   "*foo*"             -> "foo"
+    if (rule.includes("*")) {
+      const core = rule.replace(/\*/g, "");
+      if (!core) return true; // "*" means allow any
+      return ref.includes(core);
     }
-    // loose substring match if no wildcard:
-    const cleaned = allowed
-      .replace(/^\*+/, "")
-      .replace(/\/+$/, "");
-    return ref.includes(cleaned);
+
+    // no wildcard:
+    // we accept if referer contains the rule anywhere
+    // ("https://www.tradingview.com/..." includes "tradingview.com")
+    return ref.includes(rule);
   });
+
   if (!ok) {
     log("WARN referer not allowed-ish:", ref);
   }
