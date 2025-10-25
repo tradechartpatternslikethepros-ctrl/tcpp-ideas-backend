@@ -1,9 +1,10 @@
 // Trade Chart Patterns Like The Pros
 // Full production backend (Express + SSE + Upload + Email)
+// CommonJS build for Railway (node server.cjs)
 //
-// Endpoints:
+// Endpoints exposed:
 //   GET    /health
-//   GET    /events                        (SSE stream for realtime feed/likes/comments/status)
+//   GET    /events                        (SSE realtime)
 //   GET    /ideas/latest?limit=50
 //   GET    /ideas/:id
 //   POST   /ideas                         (auth)
@@ -14,38 +15,39 @@
 //   PATCH  /ideas/:id/comments/:cid
 //   DELETE /ideas/:id/comments/:cid
 //   POST   /upload                        (auth, multipart/form-data `file`)
-//   POST   /email/post                    (auth, send broadcast email / alert email)
+//   POST   /email/post                    (auth, broadcast email alert)
 //   POST   /subscribe
-//   /api/subscribe, /email/subscribe      (aliases)
-// Static:
-//   GET    /uploads/*                     (serves uploaded chart images)
+//   POST   /api/subscribe
+//   POST   /email/subscribe
+//   GET    /uploads/*                     (serves uploaded charts)
 //
-// Persists data to disk (DATA_DIR) so it survives restarts if volume is mounted.
+// Persistence:
+//   DATA_DIR/ideas.json
+//   DATA_DIR/subscribers.json
+//
+// Auth model:
+//   Requests that mutate (/ideas POST/PATCH/DELETE, /upload, /email/post)
+//   must send header: Authorization: Bearer <API_TOKEN>
 
-import fs from "fs";
-import fsp from "fs/promises";
-import path from "path";
-import { fileURLToPath } from "url";
-import express from "express";
-import cors from "cors";
-import multer from "multer";
-import nodemailer from "nodemailer";
-import crypto from "crypto";
-import dotenv from "dotenv";
+const fs = require("fs");
+const fsPromises = require("fs/promises");
+const path = require("path");
+const express = require("express");
+const cors = require("cors");
+const multer = require("multer");
+const nodemailer = require("nodemailer");
+const crypto = require("crypto");
+const dotenv = require("dotenv");
 
 dotenv.config();
 
-// ---------- path helpers ----------
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// ---------- env ----------
+// ---------- env / config ----------
 const PORT = process.env.PORT || "8080";
 const NODE_ENV = process.env.NODE_ENV || "development";
 
-const API_TOKEN = process.env.API_TOKEN || ""; // bearer token the dashboard uses
+const API_TOKEN = process.env.API_TOKEN || "";
 
-// we'll allow either CORS_ALLOW_ORIGINS or CORS_ORIGINS
+// CORS allowlist (supports wildcards like https://*.wixsite.com)
 const corsEnvRaw =
   process.env.CORS_ALLOW_ORIGINS ||
   process.env.CORS_ORIGINS ||
@@ -62,8 +64,7 @@ const UPLOAD_DIR =
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || "8");
 const MAX_REMOTE_IMAGE_MB = Number(
   process.env.MAX_REMOTE_IMAGE_MB || "5"
-);
-// note: MAX_REMOTE_IMAGE_MB is available if you later add remote-import, not currently enforced below
+); // reserved for future remote-import logic
 
 const ALLOWED_UPLOAD_TYPES = (process.env.ALLOWED_UPLOAD_TYPES ||
   "image/png,image/jpeg,image/webp")
@@ -92,7 +93,7 @@ const EMAIL_FROM =
 const EMAIL_BCC_ADMIN =
   process.env.EMAIL_BCC_ADMIN || "admin@example.com";
 const EMAIL_FORCE_ALL_TO =
-  process.env.EMAIL_FORCE_ALL_TO || ""; // comma list. if set, we send every alert here
+  process.env.EMAIL_FORCE_ALL_TO || ""; // comma list. if set, every alert goes here
 
 const SITE_NAME =
   process.env.SITE_NAME || "Trade Chart Patterns — Pro";
@@ -109,8 +110,7 @@ const ASSET_BASE_URL =
   "https://www.tradechartpatternslikethepros.com";
 
 const UPLOADS_PUBLIC_BASE_URL =
-  process.env.UPLOADS_PUBLIC_BASE_URL ||
-  ""; // e.g. https://tcpp-ideas-backend-production.up.railway.app
+  process.env.UPLOADS_PUBLIC_BASE_URL || ""; // e.g. https://tcpp-ideas-backend-production.up.railway.app
 
 const EMAIL_THEME = process.env.EMAIL_THEME || "white";
 const EMAIL_LAYOUT = process.env.EMAIL_LAYOUT || "hero-first";
@@ -122,59 +122,61 @@ const ALLOW_FETCH_REFERERS = (process.env.ALLOW_FETCH_REFERERS ||
   .map((x) => x.trim().toLowerCase())
   .filter(Boolean);
 
-// ---------- tiny log helper ----------
-function log(...args) {
-  console.log(new Date().toISOString(), "-", ...args);
+// ---------- tiny logger ----------
+function log() {
+  const args = Array.from(arguments);
+  console.log(new Date().toISOString() + " -", ...args);
 }
 
 // ---------- make sure data dirs exist ----------
-async function ensureDir(dir) {
+function ensureDirSync(dir) {
   try {
-    await fsp.mkdir(dir, { recursive: true });
-  } catch (_) {}
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    // ignore
+  }
 }
-await ensureDir(DATA_DIR);
-await ensureDir(UPLOAD_DIR);
+ensureDirSync(DATA_DIR);
+ensureDirSync(UPLOAD_DIR);
 
 // ---------- data file paths ----------
 const IDEAS_FILE = path.join(DATA_DIR, "ideas.json");
-const SUBSCRIBERS_FILE = path.join(
-  DATA_DIR,
-  "subscribers.json"
-);
+const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
 
-// ---------- in-memory state ----------
-let ideas = [];
-let subscribers = [];
-const sseClients = new Set(); // live EventSource connections
-
-// load any persisted data
-async function loadJSON(file, fallback) {
+// ---------- load persisted state (sync on boot so we start "warm") ----------
+function loadJSONSync(file, fallbackVal) {
   try {
-    const raw = await fsp.readFile(file, "utf8");
+    const raw = fs.readFileSync(file, "utf8");
     return JSON.parse(raw);
-  } catch {
-    return fallback;
+  } catch (e) {
+    return fallbackVal;
   }
 }
-async function saveJSON(file, data) {
-  await fsp.writeFile(file, JSON.stringify(data, null, 2), "utf8");
-}
 
-ideas = await loadJSON(IDEAS_FILE, []);
-subscribers = await loadJSON(SUBSCRIBERS_FILE, []);
+let ideas = loadJSONSync(IDEAS_FILE, []);
+let subscribers = loadJSONSync(SUBSCRIBERS_FILE, []);
+
+// ---------- runtime state ----------
+const sseClients = new Set(); // all active EventSource connections
 
 // ---------- helpers ----------
 function uid() {
-  return crypto.randomUUID
-    ? crypto.randomUUID()
-    : "id_" +
-        Math.random().toString(36).slice(2) +
-        Date.now().toString(36);
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return (
+    "id_" +
+    Math.random().toString(36).slice(2) +
+    Date.now().toString(36)
+  );
+}
+
+function saveJSONAsync(file, data) {
+  fsPromises
+    .writeFile(file, JSON.stringify(data, null, 2), "utf8")
+    .catch((err) => log("ERR saving", file, err));
 }
 
 function publicIdea(i) {
-  // currently we return everything; frontend masks emails client-side
+  // For now we return full object. Client handles privacy masking.
   return i;
 }
 
@@ -182,27 +184,20 @@ function findIdea(id) {
   return ideas.find((i) => String(i.id) === String(id));
 }
 
-function saveIdeasAsync() {
-  // fire and forget
-  saveJSON(IDEAS_FILE, ideas).catch((err) =>
-    log("ERR saving ideas.json", err)
-  );
-}
-
 function pruneDeleted() {
   ideas = ideas.filter((i) => !i.deletedAt);
-  saveIdeasAsync();
+  saveJSONAsync(IDEAS_FILE, ideas);
 }
 
-// broadcast to all SSE listeners
+// broadcast event to all SSE listeners
 function broadcastSSE(event, payloadObj) {
   const data = JSON.stringify(payloadObj || {});
   for (const res of sseClients) {
     try {
-      res.write(`event: ${event}\n`);
-      res.write(`data: ${data}\n\n`);
+      res.write("event: " + event + "\n");
+      res.write("data: " + data + "\n\n");
     } catch (err) {
-      // client went away
+      // connection is probably gone
       sseClients.delete(res);
       try {
         res.end();
@@ -211,28 +206,25 @@ function broadcastSSE(event, payloadObj) {
   }
 }
 
-// bearer auth middleware for protected routes
+// Bearer auth middleware
 function requireAuth(req, res, next) {
   const hdr = req.get("Authorization") || "";
   const m = hdr.match(/^Bearer\s+(.+)$/i);
   const token = m ? m[1].trim() : "";
-  // if there's no API_TOKEN set at all, treat as open
-  if (!API_TOKEN || token === API_TOKEN) {
-    return next();
-  }
+  // If API_TOKEN isn't set, effectively open
+  if (!API_TOKEN || token === API_TOKEN) return next();
   return res.status(403).json({ error: "Forbidden" });
 }
 
-// CORS allowlist matcher w/ wildcard like https://*.wixsite.com
+// wildcard-aware origin matcher for CORS
 function originAllowed(origin) {
-  if (!origin) return true; // curl / same-origin / server-side fetch
-  if (CORS_ALLOW.length === 0) return true;
+  if (!origin) return true; // e.g. curl / internal
+  if (!CORS_ALLOW.length) return true;
   const low = origin.toLowerCase();
   for (const ruleRaw of CORS_ALLOW) {
     const rule = ruleRaw.toLowerCase();
-
     if (rule.includes("*")) {
-      // convert "*.domain.com" style into regex
+      // convert like https://*.wixsite.com => ^https://.*\.wixsite\.com$
       const re = new RegExp(
         "^" +
           rule
@@ -249,7 +241,7 @@ function originAllowed(origin) {
   return false;
 }
 
-// (optional) soft referer checker — logs if request comes from some rando
+// soft referer checker (for /ideas/latest etc.)
 function checkReferer(req, res, next) {
   if (!ALLOW_FETCH_REFERERS.length) return next();
   const ref = (req.get("Referer") || "").toLowerCase();
@@ -266,10 +258,11 @@ function checkReferer(req, res, next) {
       );
       return re.test(ref);
     }
-    // loose contains if no wildcard (so "tradingview.com" hits subpages)
-    return ref.includes(
-      allowed.replace(/^\*+/, "").replace(/\/+$/, "")
-    );
+    // loose substring match if no wildcard:
+    const cleaned = allowed
+      .replace(/^\*+/, "")
+      .replace(/\/+$/, "");
+    return ref.includes(cleaned);
   });
   if (!ok) {
     log("WARN referer not allowed-ish:", ref);
@@ -277,8 +270,11 @@ function checkReferer(req, res, next) {
   return next();
 }
 
-// ---------- express app ----------
+// ---------- express setup ----------
 const app = express();
+
+// trust proxy so req.protocol is correct behind Railway's HTTPS proxy
+app.set("trust proxy", true);
 
 app.use(
   cors({
@@ -304,7 +300,7 @@ app.use(
   })
 );
 
-// serve uploaded images publicly
+// serve uploaded images back out
 app.use(
   "/uploads",
   express.static(UPLOAD_DIR, {
@@ -313,7 +309,7 @@ app.use(
   })
 );
 
-// ---------- health ----------
+// ---------- /health ----------
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -323,9 +319,9 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ---------- realtime SSE (/events) ----------
+// ---------- /events (SSE realtime) ----------
 app.get("/events", (req, res) => {
-  // dashboard might append ?token=... so we soft-check
+  // dashboard may pass ?token=... ; honor it if API_TOKEN is set
   const queryToken = (req.query && req.query.token) || "";
   if (API_TOKEN && queryToken && queryToken !== API_TOKEN) {
     return res.status(403).end();
@@ -334,20 +330,22 @@ app.get("/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.();
+  if (res.flushHeaders) res.flushHeaders();
 
   sseClients.add(res);
 
-  // hello packet
-  res.write(`event: hello\n`);
+  // initial hello packet
+  res.write("event: hello\n");
   res.write(
-    `data: ${JSON.stringify({
-      msg: "connected",
-      now: Date.now(),
-    })}\n\n`
+    "data: " +
+      JSON.stringify({
+        msg: "connected",
+        now: Date.now(),
+      }) +
+      "\n\n"
   );
 
-  req.on("close", () => {
+  req.on("close", function () {
     sseClients.delete(res);
     try {
       res.end();
@@ -363,13 +361,15 @@ app.get("/ideas/latest", checkReferer, (req, res) => {
     200,
     Number(req.query.limit || "50") || 50
   );
-  const out = [...ideas]
+  const out = []
+    .concat(ideas)
     .filter((i) => !i.deletedAt)
-    .sort(
-      (a, b) =>
+    .sort(function (a, b) {
+      return (
         new Date(b.createdAt).getTime() -
         new Date(a.createdAt).getTime()
-    )
+      );
+    })
     .slice(0, limit)
     .map(publicIdea);
 
@@ -385,118 +385,104 @@ app.get("/ideas/:id", checkReferer, (req, res) => {
   res.json({ item: publicIdea(idea) });
 });
 
-// POST /ideas (auth)
+// POST /ideas  (auth)
 app.post("/ideas", requireAuth, (req, res) => {
-  const {
-    title = "",
-    symbol = "",
-    link = "",
-    levelText = "",
-    take = "",
-    type = "post", // "post" | "signal" | "idea"
-    status = "live", // live | won | lost | etc
-    authorId = "",
-    authorName = "Member",
-    authorEmail = "",
-    media = [],
-    metrics = {},
-  } = req.body || {};
+  const body = req.body || {};
 
   const nowIso = new Date().toISOString();
-  const id = uid();
+  const idVal = uid();
 
   const likes = { by: {}, count: 0 };
   const comments = [];
 
+  const mediaArr = Array.isArray(body.media) ? body.media : [];
+
   const idea = {
-    id,
-    title,
-    symbol,
-    link,
-    levelText,
-    take,
-    type,
-    status,
-    authorId,
-    authorName,
-    authorEmail,
-    media,
-    metrics,
+    id: idVal,
+
+    title: body.title || "",
+    symbol: body.symbol || "",
+    link: body.link || "",
+    levelText: body.levelText || "",
+    take: body.take || "",
+    type: body.type || "post", // "post" | "signal" | "idea"
+    status: body.status || "live",
+
+    authorId: body.authorId || "",
+    authorName: body.authorName || "Member",
+    authorEmail: body.authorEmail || "",
+
+    media: mediaArr,
+    metrics: body.metrics || {},
+
     likes,
     comments,
+
     createdAt: nowIso,
     updatedAt: nowIso,
   };
 
-  // convenience field for frontend thumbnail
-  const firstImg = media.find((m) => m.kind === "image");
+  // convenience: first image => idea.imageUrl
+  const firstImg = mediaArr.find((m) => m.kind === "image");
   if (firstImg) {
     idea.imageUrl = firstImg.url;
   }
 
   ideas.unshift(idea);
-  saveIdeasAsync();
+  saveJSONAsync(IDEAS_FILE, ideas);
 
   broadcastSSE("idea:new", { item: publicIdea(idea) });
 
   res.json({ ok: true, item: publicIdea(idea) });
 });
 
-// PATCH /ideas/:id (auth)
+// PATCH /ideas/:id  (auth)
 app.patch("/ideas/:id", requireAuth, (req, res) => {
   const idea = findIdea(req.params.id);
   if (!idea || idea.deletedAt) {
     return res.status(404).json({ error: "Not found" });
   }
+  const body = req.body || {};
 
-  const {
-    title,
-    symbol,
-    link,
-    levelText,
-    take,
-    status,
-    media,
-    metrics,
-  } = req.body || {};
+  if (body.title !== undefined) idea.title = body.title;
+  if (body.symbol !== undefined) idea.symbol = body.symbol;
+  if (body.link !== undefined) idea.link = body.link;
+  if (body.levelText !== undefined)
+    idea.levelText = body.levelText;
+  if (body.take !== undefined) idea.take = body.take;
+  if (body.status !== undefined) idea.status = body.status;
+  if (body.metrics !== undefined) idea.metrics = body.metrics;
 
-  if (title !== undefined) idea.title = title;
-  if (symbol !== undefined) idea.symbol = symbol;
-  if (link !== undefined) idea.link = link;
-  if (levelText !== undefined) idea.levelText = levelText;
-  if (take !== undefined) idea.take = take;
-  if (status !== undefined) idea.status = status;
-  if (metrics !== undefined) idea.metrics = metrics;
-
-  if (Array.isArray(media) && media.length > 0) {
-    idea.media = media;
-    const firstImg = media.find((m) => m.kind === "image");
-    if (firstImg) idea.imageUrl = firstImg.url;
+  if (Array.isArray(body.media) && body.media.length > 0) {
+    idea.media = body.media;
+    const f = body.media.find((m) => m.kind === "image");
+    if (f) idea.imageUrl = f.url;
   }
 
   idea.updatedAt = new Date().toISOString();
-  saveIdeasAsync();
+  saveJSONAsync(IDEAS_FILE, ideas);
 
   broadcastSSE("idea:update", { item: publicIdea(idea) });
 
   res.json({ ok: true, item: publicIdea(idea) });
 });
 
-// DELETE /ideas/:id (auth)
+// DELETE /ideas/:id  (auth)
 app.delete("/ideas/:id", requireAuth, (req, res) => {
   const idea = findIdea(req.params.id);
-  if (!idea || idea.deletedAt)
+  if (!idea || idea.deletedAt) {
     return res.status(404).json({ error: "Not found" });
+  }
 
   idea.deletedAt = new Date().toISOString();
-  saveIdeasAsync();
+  saveJSONAsync(IDEAS_FILE, ideas);
 
   broadcastSSE("idea:delete", {
     id: idea.id,
     item: { id: idea.id },
   });
 
-  pruneDeleted();
+  pruneDeleted(); // also persists
 
   res.status(204).end();
 });
@@ -505,32 +491,34 @@ app.delete("/ideas/:id", requireAuth, (req, res) => {
 // body: { action: "like"|"unlike", userId, displayName }
 app.put("/ideas/:id/likes", (req, res) => {
   const idea = findIdea(req.params.id);
-  if (!idea || idea.deletedAt)
+  if (!idea || idea.deletedAt) {
     return res.status(404).json({ error: "Not found" });
+  }
 
   if (!idea.likes) {
     idea.likes = { by: {}, count: 0 };
   }
 
-  const { action, userId, displayName } = req.body || {};
-  const uidKey = String(userId || "").trim();
-  const disp = String(displayName || "Member").trim();
+  const body = req.body || {};
+  const action = body.action;
+  const userId = (body.userId || "").trim();
+  const displayName = (body.displayName || "Member").trim();
 
-  if (!uidKey) {
+  if (!userId) {
     return res
       .status(400)
       .json({ error: "userId required" });
   }
 
   if (action === "like") {
-    idea.likes.by[uidKey] = disp || "Member";
+    idea.likes.by[userId] = displayName || "Member";
   } else if (action === "unlike") {
-    delete idea.likes.by[uidKey];
+    delete idea.likes.by[userId];
   }
 
   idea.likes.count = Object.keys(idea.likes.by).length;
   idea.updatedAt = new Date().toISOString();
-  saveIdeasAsync();
+  saveJSONAsync(IDEAS_FILE, ideas);
 
   broadcastSSE("likes:update", {
     id: idea.id,
@@ -558,31 +546,32 @@ app.put("/ideas/:id/likes", (req, res) => {
 // body: { text, authorName, authorEmail }
 app.post("/ideas/:id/comments", (req, res) => {
   const idea = findIdea(req.params.id);
-  if (!idea || idea.deletedAt)
+  if (!idea || idea.deletedAt) {
     return res.status(404).json({ error: "Not found" });
+  }
 
-  const {
-    text = "",
-    authorName = "Member",
-    authorEmail = "",
-  } = req.body || {};
+  const body = req.body || {};
+  const text = body.text || "";
+  const authorName = body.authorName || "Member";
+  const authorEmail = body.authorEmail || "";
 
   if (!idea.comments) idea.comments = [];
+
   const cid = uid();
   const nowIso = new Date().toISOString();
 
-  const comment = {
+  const commentObj = {
     id: cid,
-    text,
-    authorName,
-    authorEmail,
+    text: text,
+    authorName: authorName,
+    authorEmail: authorEmail,
     createdAt: nowIso,
     updatedAt: nowIso,
   };
 
-  idea.comments.push(comment);
+  idea.comments.push(commentObj);
   idea.updatedAt = nowIso;
-  saveIdeasAsync();
+  saveJSONAsync(IDEAS_FILE, ideas);
 
   broadcastSSE("comments:update", {
     id: idea.id,
@@ -591,7 +580,7 @@ app.post("/ideas/:id/comments", (req, res) => {
 
   res.json({
     ok: true,
-    comment,
+    comment: commentObj,
     item: publicIdea(idea),
   });
 });
@@ -600,24 +589,26 @@ app.post("/ideas/:id/comments", (req, res) => {
 // body: { text }
 app.patch("/ideas/:id/comments/:cid", (req, res) => {
   const idea = findIdea(req.params.id);
-  if (!idea || idea.deletedAt)
+  if (!idea || idea.deletedAt) {
     return res.status(404).json({ error: "Not found" });
+  }
 
   const cid = req.params.cid;
-  const c = idea.comments?.find(
-    (cm) => String(cm.id) === String(cid)
-  );
-  if (!c)
+  const c = (idea.comments || []).find(function (cm) {
+    return String(cm.id) === String(cid);
+  });
+  if (!c) {
     return res
       .status(404)
       .json({ error: "Comment not found" });
+  }
 
-  if (req.body.text !== undefined) {
+  if (req.body && req.body.text !== undefined) {
     c.text = req.body.text;
   }
   c.updatedAt = new Date().toISOString();
   idea.updatedAt = c.updatedAt;
-  saveIdeasAsync();
+  saveJSONAsync(IDEAS_FILE, ideas);
 
   broadcastSSE("comments:update", {
     id: idea.id,
@@ -634,21 +625,22 @@ app.patch("/ideas/:id/comments/:cid", (req, res) => {
 // DELETE /ideas/:id/comments/:cid
 app.delete("/ideas/:id/comments/:cid", (req, res) => {
   const idea = findIdea(req.params.id);
-  if (!idea || idea.deletedAt)
+  if (!idea || idea.deletedAt) {
     return res.status(404).json({ error: "Not found" });
+  }
 
-  const cid = req.params.cid;
-  const before = idea.comments?.length || 0;
-  idea.comments = (idea.comments || []).filter(
-    (cm) => String(cm.id) !== String(cid)
-  );
-  if (idea.comments.length === before) {
+  const beforeLen = (idea.comments || []).length;
+  idea.comments = (idea.comments || []).filter(function (cm) {
+    return String(cm.id) !== String(req.params.cid);
+  });
+  if (idea.comments.length === beforeLen) {
     return res
       .status(404)
       .json({ error: "Comment not found" });
   }
+
   idea.updatedAt = new Date().toISOString();
-  saveIdeasAsync();
+  saveJSONAsync(IDEAS_FILE, ideas);
 
   broadcastSSE("comments:update", {
     id: idea.id,
@@ -660,7 +652,7 @@ app.delete("/ideas/:id/comments/:cid", (req, res) => {
 
 // ---------- upload (chart screenshots etc.) ----------
 
-// configure multer disk storage
+// multer storage on disk
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     cb(null, UPLOAD_DIR);
@@ -671,16 +663,16 @@ const storage = multer.diskStorage({
       .randomUUID()
       .replace(/-/g, "")
       .slice(0, 24);
-    cb(null, `${name}${ext || ".png"}`);
+    cb(null, name + (ext || ".png"));
   },
 });
 
 const uploadMw = multer({
-  storage,
+  storage: storage,
   limits: {
     fileSize: MAX_UPLOAD_MB * 1024 * 1024,
   },
-  fileFilter: (req, file, cb) => {
+  fileFilter: function (req, file, cb) {
     const type = (file.mimetype || "").toLowerCase();
     if (!ALLOWED_UPLOAD_TYPES.includes(type)) {
       return cb(new Error("Invalid file type"));
@@ -689,8 +681,8 @@ const uploadMw = multer({
   },
 });
 
-// POST /upload  (auth)
-// form-data: file=<image>
+// POST /upload (auth)
+// multipart/form-data with field `file`
 app.post(
   "/upload",
   requireAuth,
@@ -704,8 +696,9 @@ app.post(
 
     const basePublic =
       UPLOADS_PUBLIC_BASE_URL ||
-      `${req.protocol}://${req.get("host")}`;
-    const publicUrl = `${basePublic}/uploads/${req.file.filename}`;
+      req.protocol + "://" + req.get("host");
+    const publicUrl =
+      basePublic + "/uploads/" + req.file.filename;
 
     res.json({
       ok: true,
@@ -716,7 +709,7 @@ app.post(
   }
 );
 
-// ---------- email notify ----------
+// ---------- email alerts ----------
 
 // nodemailer transport
 const transporter = nodemailer.createTransport({
@@ -732,21 +725,24 @@ const transporter = nodemailer.createTransport({
 // escape html util
 function escapeHtml(v) {
   if (v === undefined || v === null) return "";
-  return String(v).replace(
-    /[&<>"']/g,
-    (m) =>
-      ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;",
-      }[m])
-  );
+  return String(v).replace(/[&<>"']/g, function (m) {
+    return {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    }[m];
+  });
 }
 
-// build the email body for /email/post
-function buildEmailHTML({ item = {}, actor = {}, kind = "post" }) {
+// builds the HTML email body for /email/post
+function buildEmailHTML(params) {
+  params = params || {};
+  const item = params.item || {};
+  const actor = params.actor || {};
+  const kind = params.kind || "post";
+
   const sym = item.symbol || "";
   const title = item.title || "(no title)";
   const take = item.take || item.content || "";
@@ -761,71 +757,87 @@ function buildEmailHTML({ item = {}, actor = {}, kind = "post" }) {
       ? "#00d0ff"
       : "#111827";
 
-  return `
-  <div style="background:${EMAIL_BODY_BG ||
-    "#ffffff"};font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;padding:20px;color:#111;border-top:4px solid ${heroColor};max-width:480px;margin:0 auto;">
-    <div style="text-align:center;margin-bottom:16px;">
-      <img src="${EMAIL_LOGO_URL}" alt="${SITE_NAME}" style="max-width:120px;border-radius:8px;border:1px solid #ccc;background:#fff"/>
-      <div style="font-size:12px;color:#666;margin-top:4px;">${SITE_NAME}</div>
-    </div>
-
-    <h2 style="font-size:18px;margin:0 0 8px;line-height:1.4;">
-      ${sym ? `<span style="color:${heroColor};font-weight:600;">${sym}</span> — ` : ""}${escapeHtml(
-    title
-  )}
-    </h2>
-
-    <div style="font-size:13px;color:#444;line-height:1.5;white-space:pre-line;border:1px solid #ddd;border-radius:8px;padding:12px;margin-bottom:12px;background:#fafafa;">
-      ${
-        take
-          ? `<div style="margin-bottom:8px;"><strong>Plan / Take:</strong><br/>${escapeHtml(
-              take
-            )}</div>`
-          : ""
-      }
-      ${
-        levelText
-          ? `<div><strong>Levels:</strong><br/>${escapeHtml(
-              levelText
-            )}</div>`
-          : ""
-      }
-    </div>
-
-    <div style="font-size:12px;color:#555;line-height:1.4;margin-bottom:10px;">
-      Posted ${new Date(
-        createdAt
-      ).toLocaleString()}<br/>
-      Triggered by ${escapeHtml(
-        actor.name || "Member"
-      )} (${escapeHtml(actor.email || "")})
-    </div>
-
-    ${
-      item.imageUrl
-        ? `<div style="text-align:center;margin-bottom:12px;">
-            <img src="${item.imageUrl}" alt="chart" style="max-width:100%;border:1px solid #ddd;border-radius:8px"/>
-          </div>`
-        : ""
-    }
-
-    <div style="font-size:12px;color:#999;text-align:center;border-top:1px solid #eee;padding-top:12px;">
-      <div>${SITE_NAME}</div>
-      <div><a href="${SITE_URL}" style="color:#666;text-decoration:none;">${SITE_URL}</a></div>
-    </div>
-  </div>
-  `;
+  return (
+    '<div style="background:' +
+    (EMAIL_BODY_BG || "#ffffff") +
+    ';font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;padding:20px;color:#111;border-top:4px solid ' +
+    heroColor +
+    ';max-width:480px;margin:0 auto;">' +
+    '<div style="text-align:center;margin-bottom:16px;">' +
+    '<img src="' +
+    EMAIL_LOGO_URL +
+    '" alt="' +
+    SITE_NAME +
+    '" style="max-width:120px;border-radius:8px;border:1px solid #ccc;background:#fff"/>' +
+    '<div style="font-size:12px;color:#666;margin-top:4px;">' +
+    SITE_NAME +
+    "</div>" +
+    "</div>" +
+    '<h2 style="font-size:18px;margin:0 0 8px;line-height:1.4;">' +
+    (sym
+      ? '<span style="color:' +
+        heroColor +
+        ';font-weight:600;">' +
+        sym +
+        "</span> — "
+      : "") +
+    escapeHtml(title) +
+    "</h2>" +
+    '<div style="font-size:13px;color:#444;line-height:1.5;white-space:pre-line;border:1px solid #ddd;border-radius:8px;padding:12px;margin-bottom:12px;background:#fafafa;">' +
+    (take
+      ? '<div style="margin-bottom:8px;"><strong>Plan / Take:</strong><br/>' +
+        escapeHtml(take) +
+        "</div>"
+      : "") +
+    (levelText
+      ? '<div><strong>Levels:</strong><br/>' +
+        escapeHtml(levelText) +
+        "</div>"
+      : "") +
+    "</div>" +
+    '<div style="font-size:12px;color:#555;line-height:1.4;margin-bottom:10px;">' +
+    "Posted " +
+    new Date(createdAt).toLocaleString() +
+    "<br/>" +
+    "Triggered by " +
+    escapeHtml(actor.name || "Member") +
+    " (" +
+    escapeHtml(actor.email || "") +
+    ")" +
+    "</div>" +
+    (item.imageUrl
+      ? '<div style="text-align:center;margin-bottom:12px;">' +
+        '<img src="' +
+        item.imageUrl +
+        '" alt="chart" style="max-width:100%;border:1px solid #ddd;border-radius:8px"/>' +
+        "</div>"
+      : "") +
+    '<div style="font-size:12px;color:#999;text-align:center;border-top:1px solid #eee;padding-top:12px;">' +
+    "<div>" +
+    SITE_NAME +
+    "</div>" +
+    '<div><a href="' +
+    SITE_URL +
+    '" style="color:#666;text-decoration:none;">' +
+    SITE_URL +
+    "</a></div>" +
+    "</div>" +
+    "</div>"
+  );
 }
 
 // POST /email/post (auth)
 // body: { kind, item, actor }
-// kind: "post" | "signal" | "idea"
 app.post("/email/post", requireAuth, async (req, res) => {
-  const { kind = "post", item = {}, actor = {} } =
-    req.body || {};
+  const body = req.body || {};
+  const kind = body.kind || "post";
+  const item = body.item || {};
+  const actor = body.actor || {};
 
-  // who do we send it to?
-  // if EMAIL_FORCE_ALL_TO is set, that overrides and we shotgun to that list.
+  // recipients:
+  // priority 1: EMAIL_FORCE_ALL_TO if set
+  // fallback: actor.email (the person posting)
+  // always BCC admin list if configured
   let toList = [];
   if (EMAIL_FORCE_ALL_TO) {
     toList = EMAIL_FORCE_ALL_TO.split(",")
@@ -837,7 +849,6 @@ app.post("/email/post", requireAuth, async (req, res) => {
     }
   }
 
-  // also BCC admin(s)
   const bccList = EMAIL_BCC_ADMIN
     ? EMAIL_BCC_ADMIN.split(",")
         .map((x) => x.trim())
@@ -852,21 +863,24 @@ app.post("/email/post", requireAuth, async (req, res) => {
   }
 
   const subjectPieces = [];
-  if (item.symbol) subjectPieces.push(`[${item.symbol}]`);
+  if (item.symbol) subjectPieces.push("[" + item.symbol + "]");
   subjectPieces.push(item.title || "New Update");
   const subject = subjectPieces.join(" ");
 
-  const html = buildEmailHTML({ item, actor, kind });
+  const html = buildEmailHTML({
+    item: item,
+    actor: actor,
+    kind: kind,
+  });
 
   try {
     await transporter.sendMail({
       from: EMAIL_FROM,
       to: toList,
       bcc: bccList,
-      subject,
-      html,
+      subject: subject,
+      html: html,
     });
-
     res.json({ ok: true, sent: true });
   } catch (err) {
     log("EMAIL ERROR", err);
@@ -878,38 +892,55 @@ app.post("/email/post", requireAuth, async (req, res) => {
 
 // ---------- email capture / subscribe ----------
 
-// shared handler for /subscribe, /api/subscribe, /email/subscribe
 async function handleSubscribe(req, res) {
-  const { name = "Member", email = "" } = req.body || {};
-  const e = String(email || "").trim().toLowerCase();
-  if (!e || !/.+@.+\..+/.test(e)) {
+  const body = req.body || {};
+  const name = body.name || "Member";
+  const email = (body.email || "").trim().toLowerCase();
+
+  if (!email || !/.+@.+\..+/.test(email)) {
     return res
       .status(400)
       .json({ error: "valid email required" });
   }
 
   // dedupe
-  if (!subscribers.find((s) => s.email === e)) {
+  const exists = subscribers.find(function (s) {
+    return s.email === email;
+  });
+  if (!exists) {
     subscribers.push({
       id: uid(),
       name: String(name || "Member"),
-      email: e,
+      email: email,
       addedAt: new Date().toISOString(),
     });
-    await saveJSON(SUBSCRIBERS_FILE, subscribers);
-    log("Subscribed:", e);
+    await fsPromises
+      .writeFile(
+        SUBSCRIBERS_FILE,
+        JSON.stringify(subscribers, null, 2),
+        "utf8"
+      )
+      .catch(function (err) {
+        log("ERR saving subscribers", err);
+      });
+    log("Subscribed:", email);
   }
 
   res.json({ ok: true });
 }
 
+// POST /subscribe
 app.post("/subscribe", handleSubscribe);
+// mirror endpoints the frontend might try
 app.post("/api/subscribe", handleSubscribe);
 app.post("/email/subscribe", handleSubscribe);
 
-// ---------- start server ----------
-app.listen(PORT, () => {
+// ---------- go live ----------
+app.listen(PORT, function () {
   log(
-    `TCPP backend listening on ${PORT} (${NODE_ENV}) ideas=${ideas.length}`
+    "TCPP backend listening on",
+    PORT,
+    "(" + NODE_ENV + ")",
+    "ideas=" + ideas.length
   );
 });
