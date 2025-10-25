@@ -1,26 +1,20 @@
 {
   "name": "tcpp-ideas-backend",
   "version": "1.0.0",
-  "private": true,
-  "description": "TCPP Ideas Backend (Express) + Email + Subscribers + Inline Chart Images",
+  "description": "TCPP Ideas Backend — ideas + uploads + likes + comments + email + SSE",
   "main": "server.cjs",
   "type": "commonjs",
   "scripts": {
-    "start": "node server.cjs",
-    "dev": "nodemon --watch server.cjs --ext cjs server.cjs"
+    "start": "node server.cjs"
   },
   "engines": {
-    "node": ">=18.17"
+    "node": "18.x"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "http": "^0.0.1-security",
-    "https": "^1.0.0",
     "multer": "^1.4.5-lts.1",
-    "nodemailer": "^6.9.13"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.4"
+    "nodemailer": "^6.9.15",
+    "jsonwebtoken": "^9.0.2"
   }
 }
