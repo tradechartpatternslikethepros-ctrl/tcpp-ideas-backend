@@ -3,11 +3,11 @@
  * + live status engine (EL/SL/TPs) + stop/target email triggers
  *
  * This version:
- * - CommonJS only
+ * - CommonJS, no ESM imports
+ * - Removes nanoid package (which was ESM-only)
  * - Uses internal nanoid() implemented with crypto
- * - Supports BOTH static API_TOKEN and Wix member JWT
- * - Attaches req.user from JWT/API_TOKEN
  * - CORS allowlist + referer allowlist for /price/ping
+ * - 🔐 NEW: also accepts JWT (Wix member token) in addition to API_TOKEN
  */
 
 'use strict';
@@ -21,11 +21,12 @@ const multer = require('multer');
 const nodemailer = require('nodemailer');
 const https = require('https');
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken'); // <-- needed so we can verify Wix JWTs
+const jwt = require('jsonwebtoken'); // <-- added
 
 /* ---------------------- ID HELPER ----------------- */
 /* generate short url-safe IDs similar to nanoid */
 function nanoid(size = 12) {
+  // crypto.randomBytes(size) -> base64url string -> slice to length
   return crypto.randomBytes(size).toString('base64url').slice(0, size);
 }
 
@@ -33,8 +34,8 @@ function nanoid(size = 12) {
 const PORT      = process.env.PORT || 8080;
 const NODE_ENV  = process.env.NODE_ENV || 'production';
 
-const API_TOKEN = process.env.API_TOKEN || '';
-const JWT_SECRET= process.env.JWT_SECRET || ''; // must match Wix getIdeasAuth() secret
+const API_TOKEN  = process.env.API_TOKEN  || '';
+const JWT_SECRET = process.env.JWT_SECRET || ''; // <-- added
 
 const _corsEnv  = process.env.CORS_ORIGINS || process.env.CORS_ALLOW_ORIGINS || '*';
 const CORS_ORIGINS = _corsEnv.split(',').map(s => s.trim()).filter(Boolean);
@@ -186,6 +187,7 @@ function buildMulter() {
 }
 
 /* ---------------------- AUTH ---------------------- */
+// read token from header or ?token=
 function readBearer(req) {
   const h = req.headers['authorization'];
   if (h && /^Bearer\s+/i.test(h)) return h.replace(/^Bearer\s+/i, '').trim();
@@ -195,63 +197,44 @@ function readQueryToken(req) {
   return (req.query && String(req.query.token || '').trim()) || '';
 }
 
-// decode either:
-// - static API_TOKEN (treated as admin)
-// - Wix JWT (signed with JWT_SECRET)
-function decodeUserToken(tok){
-  if (!tok) return null;
+// tiny helper: does this token count as valid?
+// valid if:
+//   - it's exactly API_TOKEN
+//   - OR it's a JWT signed with JWT_SECRET
+function tokenIsAllowed(tok) {
+  if (!tok) return false;
 
-  // 1. Exact API_TOKEN -> admin
   if (API_TOKEN && tok === API_TOKEN) {
-    return {
-      role:  'admin',
-      id:    'admin',
-      name:  'Admin',
-      email: 'admin@local'
-    };
+    return true;
   }
 
-  // 2. Wix JWT
   if (JWT_SECRET) {
     try {
-      const p = jwt.verify(tok, JWT_SECRET);
-      return {
-        role:  (p.role === 'admin') ? 'admin' : 'user',
-        id:    String(p.sub || p.id || p.userId || '').slice(0,120) || 'member',
-        name:  String(p.name || 'Member').slice(0,120),
-        email: String(p.email || '').toLowerCase()
-      };
+      jwt.verify(tok, JWT_SECRET);
+      return true;
     } catch (_) {
-      // bad token -> fall through
+      // bad jwt -> not allowed
     }
   }
 
-  return null;
+  return false;
 }
 
-// middleware: attach req.user if valid
+// middleware for protected routes
 function requireAuth(req, res, next) {
-  // If neither API_TOKEN nor JWT_SECRET is set, allow open (dev mode)
-  if (!API_TOKEN && !JWT_SECRET) {
-    return next();
-  }
+  // if neither API_TOKEN nor JWT_SECRET configured -> open mode
+  if (!API_TOKEN && !JWT_SECRET) return next();
 
-  const tok  = readBearer(req) || readQueryToken(req);
-  const user = decodeUserToken(tok);
-
-  if (!user) {
-    return err(res, 401, 'Unauthorized');
-  }
-
-  req.user = user;
+  const tok = readBearer(req) || readQueryToken(req);
+  if (!tokenIsAllowed(tok)) return err(res, 401, 'Unauthorized');
   next();
 }
 
-// SSE auth check
+// same check for SSE
 function sseAuthOK(req) {
   if (!API_TOKEN && !JWT_SECRET) return true;
   const tok = readQueryToken(req);
-  return !!decodeUserToken(tok);
+  return tokenIsAllowed(tok);
 }
 
 /* ----------------- REFERER GUARD ------------------
@@ -262,6 +245,7 @@ function sseAuthOK(req) {
    or wildcard ("*.tradingview.com").
 ---------------------------------------------------*/
 function wildcardToRegex(pattern) {
+  // escape regex chars, then turn "*" into ".*"
   let esc = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
   esc = esc.replace(/\\\*/g, '.*');
   return new RegExp('^' + esc + '$', 'i');
@@ -303,7 +287,7 @@ const clients = new Set(); // { id, res, ping }
 function sseSend(event, data) {
   const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const c of clients) {
-    try { c.res.write(line); } catch {}
+    try { c.res.write(line); } catch { /* ignore */ }
   }
 }
 function sseSendTo(res, event, data) {
@@ -315,7 +299,7 @@ const app = express();
 
 /* ----- CORS allow logic ----- */
 function isOriginAllowed(origin) {
-  if (!origin) return true; // no Origin header -> allow (curl/server2server)
+  if (!origin) return true; // no Origin header -> allow (curl / server2server)
 
   if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return true;
 
@@ -332,7 +316,7 @@ function isOriginAllowed(origin) {
       return protocol === 'https:';
     }
 
-    // wildcard like https://*.wixsite.com from env
+    // wildcard like https://*.wixsite.com
     for (const pat of CORS_ORIGINS) {
       if (!pat.includes('*')) continue;
       const m = pat.match(/^https?:\/\/\*\.(.+)$/i);
@@ -369,7 +353,7 @@ app.use('/uploads', express.static(UPLOAD_DIR, {
   index: false,
   maxAge: '30d',
   setHeaders: res => {
-    // so images can be embedded on Wix site etc
+    // so images can be embedded on wix site etc
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   }
 }));
@@ -651,23 +635,9 @@ app.delete('/ideas/:id', requireAuth, async (req, res) => {
 
 /* ---------------------- LIKES --------------------- */
 async function likeHandler(req, res) {
-  const actionRaw = req.body?.action || req.body?.op || '';
-  const action    = String(actionRaw).toLowerCase();
-
-  // prefer the authenticated user if present
-  const userId = String(
-    (req.user && (req.user.id || req.user.email)) ||
-    req.body?.userId ||
-    req.body?.by ||
-    'device'
-  ).slice(0,120);
-
-  const displayName = String(
-    (req.user && req.user.name) ||
-    req.body?.displayName ||
-    req.body?.name ||
-    'Member'
-  ).slice(0,120);
+  const action      = String(req.body?.action || req.body?.op || '').toLowerCase();
+  const userId      = String(req.body?.userId || req.body?.by || '').slice(0, 120) || 'device';
+  const displayName = String(req.body?.displayName || req.body?.name || 'Member').slice(0, 120);
 
   if (!['like', 'unlike'].includes(action)) return err(res, 400, 'Invalid action');
 
@@ -708,20 +678,11 @@ async function _commentAdd(req, res) {
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
-  const text = String(req.body?.text || '').trim();
+  const text       = String(req.body?.text || '').trim();
+  const authorId   = String(req.body?.authorId || '').slice(0, 120);
+  const authorName = String(req.body?.authorName || 'Member').slice(0, 120);
+
   if (!text) return err(res, 400, 'text required');
-
-  const authorId = String(
-    (req.user && req.user.id) ||
-    req.body?.authorId ||
-    ''
-  ).slice(0,120);
-
-  const authorName = String(
-    (req.user && req.user.name) ||
-    req.body?.authorName ||
-    'Member'
-  ).slice(0,120);
 
   const c = {
     id: nanoid(10),
@@ -969,7 +930,6 @@ function _emailShell({
 
 function emailTemplatePost(item) {
   const title   = item?.title || 'New Idea';
-  theSymbol:
   const symbol  = item?.symbol || '';
   const levels  = _bullets(item?.levelText || item?.levels || '');
   const plan    = _bullets(item?.take || item?.content || '');
