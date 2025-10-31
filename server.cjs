@@ -2,23 +2,16 @@
  * TCPP Ideas Backend — ideas + uploads + likes + comments
  * + live status engine (EL/SL/TPs) + stop/target email triggers
  *
- * This version (updated):
+ * This version:
  * - CommonJS, no ESM imports
  * - Uses internal nanoid() (crypto-based) instead of nanoid package
  * - CORS allowlist + referer allowlist for /price/ping
  * - Accepts JWT (Wix member token) in addition to API_TOKEN
  * - 🔐 decodes JWT → req.user {id,email,name,isAdmin}
  * - 🔐 admin gating for create/update/delete ideas, price/ping, email blast, debug email
- * - 🔐 comments:
- *      - store stable authorId + authorName per comment
- *      - authorName now taken from request (body/displayName or x-user-name) before falling back to req.user.name
- *      - authorId stays tied to req.user.id (so users can only edit/delete their own)
- *      - edit/delete still author-only OR admin
- * - comments now return authorId + authorName to the client so the UI can show correct username
- *   and know whether to show Edit/Delete
- * - GET /ideas/latest and GET /ideas/:id now include authorId + authorName per comment
- * - comment add/edit/delete endpoints return the same sanitized shape (id, authorId, authorName, text, createdAt, updatedAt)
- * - safer string trims on req.body
+ * - 🔐 comments/likes hardened so requests with API_TOKEN cannot create “by api” content
+ *   (require real member identity; prefer headers/body over admin token)
+ * - comments store and return authorId + authorName; same for GET responses
  */
 
 'use strict';
@@ -34,63 +27,7 @@ const https = require('https');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
-/* ========= Author / Identity helpers ========= */
-const RESERVED_NAMES = new Set(['api','system','backend','service','member','(user)','trader']);
-
-function sanitizeName(s=''){
-  return String(s)
-    .replace(/[^\p{Letter}\p{Number}\s._-]/gu, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 60);
-}
-function emailLocal(e=''){
-  const m = String(e).trim().toLowerCase().match(/^([^@]+)/);
-  return m ? m[1] : '';
-}
-
-/** Build req.actor = { id, name, email } from JWT, headers, or body (in that order) */
-function authorInjector(req, _res, next){
-  // Try existing req.user (set by requireAuth), then headers, then body
-  const uj   = req.user || {};
-  const hN   = (req.headers['x-user-name']  || '').toString().trim();
-  const hE   = (req.headers['x-user-email'] || '').toString().trim().toLowerCase();
-  const bN   = (req.body && (req.body.displayName || req.body.authorName || req.body.name) || '').toString().trim();
-  const bE   = (req.body && (req.body.authorEmail || req.body.email) || '').toString().trim().toLowerCase();
-
-  const rawName  = (uj.name || hN || bN || '').trim();
-  const rawEmail = (uj.email || hE || bE || '').trim().toLowerCase();
-
-  let cleanName = sanitizeName(rawName);
-  if(!cleanName || RESERVED_NAMES.has(cleanName.toLowerCase())){
-    cleanName = sanitizeName(emailLocal(rawEmail)) || 'Member';
-  }
-
-  const id =
-    (uj.id && String(uj.id)) ||
-    (rawEmail ? ('email:' + rawEmail) : '') ||
-    ('anon:' + (req.ip||'') + ':' + (req.headers['user-agent']||'').slice(0,24));
-
-  req.actor = { id, name: cleanName, email: rawEmail };
-  next();
-}
-
-/** Ensure outgoing records never leak "api"/blank/garbage author names */
-function normalizeAuthorTriplet(doc){
-  if(!doc) return doc;
-  const nm = sanitizeName(doc.authorName||'');
-  const em = String(doc.authorEmail||'').trim().toLowerCase();
-  let out = nm;
-  if(!out || RESERVED_NAMES.has(out.toLowerCase())){
-    out = sanitizeName(emailLocal(em)) || 'Member';
-  }
-  doc.authorName  = out;
-  doc.authorEmail = em;
-  return doc;
-}
-
 /* ---------------------- ID HELPER ----------------- */
-/* generate short url-safe IDs similar to nanoid */
 function nanoid(size = 12) {
   return crypto.randomBytes(size).toString('base64url').slice(0, size);
 }
@@ -118,9 +55,6 @@ const ALLOWED_UPLOAD_TYPES = (process.env.ALLOWED_UPLOAD_TYPES
 
 const PRICE_STALE_SEC = Number(process.env.PRICE_STALE_SEC || 900);
 
-/* allowlist for /price/ping source (TradingView etc)
-   comma-separated list like: "tradingview.com,*.tradingview.com"
-*/
 const ALLOW_FETCH_REFERERS = (process.env.ALLOW_FETCH_REFERERS || '')
   .split(',')
   .map(s => s.trim().toLowerCase())
@@ -135,7 +69,7 @@ const SMTP_PASS   = process.env.SMTP_PASS   || '';
 
 const MAIL_FROM         = process.env.MAIL_FROM || '';
 const MAIL_FROM_NAME    = process.env.MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
-const EMAIL_FROM        = process.env.EMAIL_FROM || ''; // inline "Name <email>"
+const EMAIL_FROM        = process.env.EMAIL_FROM || '';
 const EMAIL_REPLY_TO    = (process.env.EMAIL_REPLY_TO || '').trim();
 
 const EMAIL_BCC_ADMIN   = (process.env.EMAIL_BCC_ADMIN || '')
@@ -252,8 +186,6 @@ function buildMulter() {
 }
 
 /* ---------------------- AUTH ---------------------- */
-
-// read token from header or ?token=
 function readBearer(req) {
   const h = req.headers['authorization'] || req.headers['Authorization'];
   if (h && /^Bearer\s+/i.test(h)) return h.replace(/^Bearer\s+/i, '').trim();
@@ -263,21 +195,13 @@ function readQueryToken(req) {
   return (req.query && String(req.query.token || '').trim()) || '';
 }
 
-// decode token -> user object OR null
 function decodeToken(tok) {
   if (!tok) return null;
 
-  // direct API token = god mode/admin
   if (API_TOKEN && tok === API_TOKEN) {
-    return {
-      id: 'api',
-      email: '',
-      name: 'api',
-      isAdmin: true
-    };
+    return { id: 'api', email: '', name: 'api', isAdmin: true };
   }
 
-  // signed Wix member JWT (from getDashboardJWT)
   if (JWT_SECRET) {
     try {
       const decoded = jwt.verify(tok, JWT_SECRET) || {};
@@ -287,16 +211,12 @@ function decodeToken(tok) {
         name: decoded.name || '',
         isAdmin: !!decoded.isAdmin
       };
-    } catch (_) {
-      // bad jwt
-    }
+    } catch (_) {}
   }
 
   return null;
 }
 
-// middleware: attach req.user (and block if invalid)
-// if neither API_TOKEN nor JWT_SECRET is set -> open mode for dev
 function requireAuth(req, res, next) {
   if (!API_TOKEN && !JWT_SECRET) {
     req.user = { id:'open', email:'', name:'open', isAdmin:true };
@@ -311,7 +231,6 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// helper: for routes that only admins should hit
 function requireAdmin(req, res, next) {
   if (!req.user || !req.user.isAdmin) {
     return err(res, 403, 'forbidden');
@@ -319,26 +238,18 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// SSE auth check (query token only)
 function sseAuthOK(req) {
   if (!API_TOKEN && !JWT_SECRET) return true;
   const tok = readQueryToken(req);
   return !!decodeToken(tok);
 }
 
-/* ----------------- REFERER GUARD ------------------
-   Used ONLY for /price/ping so TradingView etc can hit it,
-   and random strangers can't spam it.
-
-   ALLOW_FETCH_REFERERS can have plain hosts ("tradingview.com")
-   or wildcard ("*.tradingview.com").
----------------------------------------------------*/
+/* ----------------- REFERER GUARD ------------------ */
 function wildcardToRegex(pattern) {
   let esc = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
   esc = esc.replace(/\\\*/g, '.*');
   return new RegExp('^' + esc + '$', 'i');
 }
-
 const ALLOWED_REF_REGEXES = ALLOW_FETCH_REFERERS.map(p => {
   try { return wildcardToRegex(p); } catch { return null; }
 }).filter(Boolean);
@@ -353,29 +264,21 @@ function getRefHost(req) {
     return '';
   }
 }
-
 function checkReferer(req, res, next) {
-  if (!ALLOWED_REF_REGEXES.length) {
-    // nothing configured -> allow everyone
-    return next();
-  }
+  if (!ALLOWED_REF_REGEXES.length) return next();
   const host = getRefHost(req);
-  if (!host) {
-    return err(res, 403, 'Forbidden (no referer)');
-  }
+  if (!host) return err(res, 403, 'Forbidden (no referer)');
   const pass = ALLOWED_REF_REGEXES.some(rx => rx.test(host));
-  if (!pass) {
-    return err(res, 403, 'Forbidden referer');
-  }
+  if (!pass) return err(res, 403, 'Forbidden referer');
   next();
 }
 
 /* ----------------------- SSE ---------------------- */
-const clients = new Set(); // { id, res, ping }
+const clients = new Set();
 function sseSend(event, data) {
   const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const c of clients) {
-    try { c.res.write(line); } catch { /* ignore */ }
+    try { c.res.write(line); } catch {}
   }
 }
 function sseSendTo(res, event, data) {
@@ -385,26 +288,20 @@ function sseSendTo(res, event, data) {
 /* ----------------------- APP --------------------- */
 const app = express();
 
-/* ----- CORS allow logic ----- */
 function isOriginAllowed(origin) {
-  if (!origin) return true; // no Origin header -> allow (curl / server2server)
+  if (!origin) return true;
 
   if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return true;
 
   try {
     const { protocol, host } = new URL(origin);
 
-    // wix editor/preview
     if (host.endsWith('.wixsite.com')) {
       return protocol === 'https:';
     }
-
-    // Wix CDN/media
     if (host.endsWith('.filesusr.com')) {
       return protocol === 'https:';
     }
-
-    // wildcard like https://*.wixsite.com
     for (const pat of CORS_ORIGINS) {
       if (!pat.includes('*')) continue;
       const m = pat.match(/^https?:\/\/\*\.(.+)$/i);
@@ -412,8 +309,6 @@ function isOriginAllowed(origin) {
         return protocol === 'https:';
       }
     }
-
-    // localhost dev
     if (/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host)) return true;
   } catch {
     return false;
@@ -421,28 +316,21 @@ function isOriginAllowed(origin) {
   return false;
 }
 
-/* CORS middleware */
 app.use(cors({
   origin: (origin, cb) => {
     const allowed = isOriginAllowed(origin);
-    if (!allowed) {
-      console.error(`CORS blocked: ${origin}`);
-    }
+    if (!allowed) console.error(`CORS blocked: ${origin}`);
     cb(null, allowed);
   },
   credentials: false
 }));
 
-/* body parsing */
 app.use(express.json({ limit: '1mb' }));
-app.use(authorInjector); // <- derives req.actor { id, name, email }
 
-/* static uploads */
 app.use('/uploads', express.static(UPLOAD_DIR, {
   index: false,
   maxAge: '30d',
   setHeaders: res => {
-    // so images can be embedded on wix site etc
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   }
 }));
@@ -533,7 +421,7 @@ function normalizeIdea(input) {
       targets: targets,
       last: null,
       lastAt: null,
-      statusLight: 'gray', // gray|green|orange|red|blue
+      statusLight: 'gray',
       statusNote: '',
       hitStop: false,
       hitTargetIndex: null,
@@ -549,7 +437,6 @@ function normalizeIdea(input) {
   };
 }
 
-// sanitize idea for public / frontend
 function ideaPublic(it) {
   return {
     id: it.id,
@@ -647,54 +534,45 @@ function evalStatus(idea){
 }
 
 /* -------------------- IDEAS CRUD ------------------ */
-
-// public latest feed
 app.get('/ideas/latest', async (req, res) => {
   const limit = Math.min(Number(req.query.limit || 30), 100);
   const db = await loadDB();
   const items = [...db.ideas]
     .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, limit)
-    .map(x => ideaPublic(normalizeAuthorTriplet({ ...x })));
+    .map(ideaPublic);
   ok(res, { items, ideas: items });
 });
 
-// public single idea
 app.get('/ideas/:id', async (req, res) => {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
-  ok(res, { item: ideaPublic(normalizeAuthorTriplet({ ...it })) });
+  ok(res, { item: ideaPublic(it) });
 });
 
-// create idea (admin only)
 app.post('/ideas', requireAuth, requireAdmin, async (req, res) => {
   const db = await loadDB();
 
-  // Author comes from req.actor (built by authorInjector), never trust client fields
   const it = normalizeIdea({
     ...req.body,
-    authorId:    req.actor?.id    || req.user?.id || 'anon',
-    authorName:  req.actor?.name  || 'Member',
-    authorEmail: req.actor?.email || ''
+    authorId: req.user.id,
+    authorName: req.user.name || 'Member',
+    authorEmail: req.user.email || ''
   });
 
   if (!it.imageUrl && Array.isArray(it.media) && it.media[0]?.url) {
     it.imageUrl = it.media[0].url;
   }
 
-  // Clean the triplet before storing
-  normalizeAuthorTriplet(it);
-
   db.ideas.unshift(it);
   await saveDB(db);
 
-  const pub = ideaPublic(normalizeAuthorTriplet({ ...it }));
+  const pub = ideaPublic(it);
   sseSend('idea:new', pub);
   ok(res, { item: pub });
 });
 
-// update idea (admin only)
 app.patch('/ideas/:id', requireAuth, requireAdmin, async (req, res) => {
   const db = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
@@ -727,12 +605,11 @@ app.patch('/ideas/:id', requireAuth, requireAdmin, async (req, res) => {
 
   await saveDB(db);
 
-  const pub = ideaPublic(normalizeAuthorTriplet({ ...it }));
+  const pub = ideaPublic(it);
   sseSend('idea:update', pub);
   ok(res, { item: pub });
 });
 
-// delete idea (admin only)
 app.delete('/ideas/:id', requireAuth, requireAdmin, async (req, res) => {
   const db = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
@@ -751,15 +628,21 @@ async function likeHandler(req, res) {
   if (!it) return err(res, 404, 'Not found');
 
   const action = String(req.body?.action || req.body?.op || '').toLowerCase();
-
-  // prefer trusted identity from req.user
-  const fallbackUserId = (req.user?.email || req.user?.id || 'device').slice(0,120);
-  const fallbackName   = (req.user?.name || 'Member').slice(0,120);
-
-  const userId      = (String(req.body?.userId || req.body?.by || '').slice(0, 120)) || fallbackUserId;
-  const displayName = (String(req.body?.displayName || req.body?.name || '').slice(0,120)) || fallbackName;
-
   if (!['like', 'unlike'].includes(action)) return err(res, 400, 'Invalid action');
+
+  const headerName  = (req.headers['x-user-name']  || '').toString().trim();
+  const headerEmail = (req.headers['x-user-email'] || '').toString().trim();
+
+  const isApiActor = req.user?.id === 'api';
+  const userId = String(
+    req.body?.userId || req.body?.by || headerEmail || req.user?.email || (!isApiActor ? req.user?.id : '')
+  ).slice(0,120);
+
+  const displayName = String(
+    req.body?.displayName || req.body?.name || headerName || (!isApiActor ? req.user?.name : '') || 'Member'
+  ).slice(0,120);
+
+  if (!userId) return err(res, 403, 'member identity required');
 
   it.likes ||= { count: 0, by: {} };
   it.likes.by ||= {};
@@ -775,13 +658,8 @@ async function likeHandler(req, res) {
 
   await saveDB(db);
 
-  const out = { id: it.id, likeCount: it.likes.count };
-  sseSend('likes:update', out);
-
-  ok(res, {
-    likeCount: it.likes.count,
-    likes: { count: it.likes.count }
-  });
+  sseSend('likes:update', { id: it.id, likeCount: it.likes.count });
+  ok(res, { likeCount: it.likes.count, likes: { count: it.likes.count } });
 }
 
 app.put('/ideas/:id/likes', requireAuth, likeHandler);
@@ -789,22 +667,7 @@ app.post('/ideas/:id/likes', requireAuth, likeHandler);
 app.put('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 app.post('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 
-/* -------------------- COMMENTS --------------------
-   IMPORTANT CHANGES:
-   - We now store both authorId and authorName on each comment.
-   - authorName priority:
-        req.body.displayName / req.body.name
-     -> req.headers['x-user-name']
-     -> req.user.name
-     -> "Member"
-   - authorId priority:
-        req.user.id
-     -> req.user.email
-     -> fallback anon-<nanoid>
-   We NEVER overwrite authorId/authorName on edit. We only let the
-   same authorId (or admin) edit/delete.
----------------------------------------------------*/
-
+/* -------------------- COMMENTS -------------------- */
 function sanitizeCommentsArray(arr) {
   return (arr || []).map(x => ({
     id: x.id,
@@ -827,22 +690,20 @@ async function _commentAdd(req, res) {
   ).toString().trim();
   if (!rawText) return err(res, 400, 'text required');
 
-  // derive identity
   const headerName  = (req.headers['x-user-name']  || '').toString().trim();
   const headerEmail = (req.headers['x-user-email'] || '').toString().trim();
+  const isApiActor  = req.user?.id === 'api';
 
-  // stable authorId primarily from req.user
-  const authorId = (
-    (req.user?.id || req.user?.email || headerEmail || '')
-      .toString()
-      .slice(0,120)
-  ) || ('anon-' + nanoid(6));
+  const authorId = String(
+    req.body?.userId || headerEmail || req.user?.email || (!isApiActor ? req.user?.id : '')
+  ).slice(0,120) || ('anon-' + nanoid(6));
 
-  // display name priority (client wins for label, but perms still use authorId)
-  const derivedName = (
-    (req.body?.displayName || req.body?.name || headerName || req.user?.name || 'Member')
-      .toString()
-      .trim()
+  if (isApiActor && authorId.startsWith('anon-')) {
+    return err(res, 403, 'member identity required');
+  }
+
+  const derivedName = String(
+    req.body?.displayName || req.body?.name || headerName || (!isApiActor ? req.user?.name : '') || 'Member'
   ).slice(0,120) || 'Member';
 
   const now = nowISO();
@@ -861,10 +722,7 @@ async function _commentAdd(req, res) {
   await saveDB(db);
 
   const items = sanitizeCommentsArray(it.comments.items);
-
-  // SSE update with sanitized items
   sseSend('comments:update', { id: it.id, items });
-
   ok(res, { items });
 }
 
@@ -874,14 +732,9 @@ async function _commentEdit(req, res) {
   if (!it) return err(res, 404, 'Not found');
 
   const all = (it.comments?.items || []);
-  the:
-  {
-    // keep label stable; we only allow edits to text
-  }
   const c = all.find(x => String(x.id) === String(req.params.cid));
   if (!c) return err(res, 404, 'comment not found');
 
-  // authz: admin OR same author
   const canEdit = (req.user?.isAdmin || (req.user?.id && req.user.id === c.authorId));
   if (!canEdit) return err(res, 403, 'forbidden');
 
@@ -897,7 +750,6 @@ async function _commentEdit(req, res) {
   await saveDB(db);
 
   const items = sanitizeCommentsArray(it.comments.items);
-
   sseSend('comments:update', { id: it.id, items });
   ok(res, { items });
 }
@@ -911,7 +763,6 @@ async function _commentDelete(req, res) {
   const target = beforeList.find(x => String(x.id) === String(req.params.cid));
   if (!target) return err(res, 404, 'comment not found');
 
-  // authz: admin OR same author
   const canDelete = (req.user?.isAdmin || (req.user?.id && req.user.id === target.authorId));
   if (!canDelete) return err(res, 403, 'forbidden');
 
@@ -920,7 +771,6 @@ async function _commentDelete(req, res) {
   await saveDB(db);
 
   const items = sanitizeCommentsArray(it.comments.items);
-
   sseSend('comments:update', { id: it.id, items });
   ok(res, { items });
 }
@@ -1074,7 +924,7 @@ function _emailShell({
 
         <tr><td align="left" style="padding:8px 20px 24px 20px">
           <table role="presentation" cellpadding="0" cellspacing="0"><tr>
-            <td><a href="${_esc(ctaHref)}" style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;text-decoration:none;border-radius:999px;font-weight:900;font-size:14px" target="_blank" rel="noopener">${_esc(ctaText || 'Open on Dashboard')}</a></td>
+            <td><a href="${_esc(ideaDeepLink({id:'',symbol:''}))}" style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;text-decoration:none;border-radius:999px;font-weight:900;font-size:14px" target="_blank" rel="noopener">${_esc(ctaText || 'Open on Dashboard')}</a></td>
             <td width="12"></td>
             <td><a href="${_esc(SITE_URL)}" style="display:inline-block;padding:12px 16px;background:transparent;color:${visitColor};text-decoration:none;border-radius:999px;font-weight:700;font-size:14px;border:${visitBor}" target="_blank" rel="noopener">Visit Site</a></td>
           </tr></table>
@@ -1112,11 +962,10 @@ function emailTemplatePost(item) {
   });
 
   const subject = `🔔 New Idea: ${symbol ? `${symbol} — `:''}${title || 'Update'}`;
-
   return { subject, html };
 }
 
-function emailTemplateStatus(item, kind /* 'stop' | 'target' */, info) {
+function emailTemplateStatus(item, kind, info) {
   const title   = item?.title || '';
   const symbol  = item?.symbol || '';
   const levels  = _bullets(item?.levelText || item?.levels || '');
@@ -1151,24 +1000,20 @@ function emailTemplateStatus(item, kind /* 'stop' | 'target' */, info) {
 }
 
 async function recipientsFor(reqBody){
-  // 1. EMAIL_FORCE_ALL_TO overrides everything (great for testing)
   const forced = splitEmails(EMAIL_FORCE_ALL_TO);
   if (forced.length) return { list: forced, mode:'forced' };
 
-  // 2. active subscribers
   const subs = await loadSubs().catch(()=>blankSubs());
   const list = uniq((subs.subs||[])
     .map(s=>String(s.email||'').toLowerCase())
     .filter(e=>EMAIL_RX_LOCAL.test(e)));
   if (list.length) return { list, mode:'subs' };
 
-  // 3. actor email (fallback for manual post)
   const actorEmail = String(reqBody?.actor?.email || reqBody?.actorEmail || '')
     .trim()
     .toLowerCase();
   if (EMAIL_RX_LOCAL.test(actorEmail)) return { list:[actorEmail], mode:'actor' };
 
-  // 4. admin BCC only
   const admins = (EMAIL_BCC_ADMIN || []).filter(e => EMAIL_RX_LOCAL.test(e));
   return admins.length
     ? { list: admins, mode:'admin' }
@@ -1181,7 +1026,6 @@ function getMailer(){
 }
 
 async function sendEmailBlast({ subject, html, toList }){
-  // Try SMTP first
   try{
     const tx = getMailer();
     if (tx && toList.length){
@@ -1200,26 +1044,18 @@ async function sendEmailBlast({ subject, html, toList }){
         replyTo
       });
 
-      return {
-        sent: toList.length,
-        messageId: info?.messageId || '',
-        via:'smtp'
-      };
+      return { sent: toList.length, messageId: info?.messageId || '', via:'smtp' };
     }
   }catch(e){
     console.warn('[email][smtp] failed, trying HTTP fallback:', e?.message || e);
   }
 
-  // Fallback: Mailjet REST API using SMTP_USER/SMTP_PASS
   if (!(SMTP_USER && SMTP_PASS)) throw new Error('No SMTP creds for HTTP fallback');
   if (!toList.length) return { sent:0, via:'http' };
 
   const payload = {
     Messages: [{
-      From: {
-        Email: (MAIL_FROM || SMTP_USER),
-        Name: MAIL_FROM_NAME || 'Notifier'
-      },
+      From: { Email: (MAIL_FROM || SMTP_USER), Name: MAIL_FROM_NAME || 'Notifier' },
       To: toList.map(e => ({ Email: e })),
       Subject: subject,
       HTMLPart: html,
@@ -1262,19 +1098,14 @@ async function sendEmailBlast({ subject, html, toList }){
 }
 
 /* ---------------------- EMAIL ROUTES ------------- */
-// email blast to subs (admin only)
 app.post('/email/post', requireAuth, requireAdmin, async (req, res) => {
-  try{
+  try {
     const item = req.body?.item || req.body?.data || null;
     if (!item) return err(res, 400, 'item required');
 
     const { list, mode } = await recipientsFor(req.body || {});
     if (!list.length) {
-      return ok(res, {
-        ok:true,
-        sent:0,
-        info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)'
-      });
+      return ok(res, { ok:true, sent:0, info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)' });
     }
 
     const tpl = emailTemplatePost(item);
@@ -1285,40 +1116,24 @@ app.post('/email/post', requireAuth, requireAdmin, async (req, res) => {
     });
 
     ok(res, { ok:true, sent: result.sent, mode, via: result.via });
-  }catch(e){
+  } catch(e) {
     err(res, 500, e.message || 'Email failed');
   }
 });
 
 /* ---------------------- STATUS EMAIL TRIGGERS ----- */
-async function maybeNotify(idea, reason /* 'stop' | 'target' */, info) {
+async function maybeNotify(idea, reason, info) {
   try{
     const { list } = await recipientsFor({});
     if (!list.length) return;
     const tpl = emailTemplateStatus(idea, reason, info);
-    await sendEmailBlast({
-      subject: tpl.subject,
-      html: tpl.html,
-      toList: list
-    });
+    await sendEmailBlast({ subject: tpl.subject, html: tpl.html, toList: list });
   } catch (e){
     console.warn('[notify]', reason, idea?.id, e?.message || e);
   }
 }
 
-/* ---------------------- PRICE PING ----------------
- * POST /price/ping
- *  body: { symbol?: string, id?: string, price: number, at?: ISO }
- *  - If id present -> update that idea
- *  - else update ALL live ideas matching symbol
- *  - Triggers SSE idea:status + idea:update
- *  - Fires email once on stop/target hit
- *
- * We ALSO gate this route with checkReferer() so only approved
- * referers/origins (tradingview etc.) can hit it in production.
- *
- * 🔐 requireAdmin: only admin/api token should be allowed to move live prices.
- ---------------------------------------------------*/
+/* ---------------------- PRICE PING ---------------- */
 app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res) => {
   const price  = nnum(req.body?.price);
   const at     = String(req.body?.at || nowISO());
@@ -1337,7 +1152,6 @@ app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res
 
     evalStatus(it);
 
-    // Track first target hit
     const dir = it.direction || 'neutral';
     const tgs = Array.isArray(it.metrics.targets)
       ? it.metrics.targets.map(Number)
@@ -1357,7 +1171,6 @@ app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res
       }
     }
 
-    // Notify once
     it.metrics.notified ||= { stop:false, targets:{} };
 
     if (it.metrics.statusLight === 'red' && !it.metrics.notified.stop) {
@@ -1377,7 +1190,6 @@ app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res
     it.updatedAt = nowISO();
     touched.push(ideaPublic(it));
 
-    // Push SSE quick status
     sseSend('idea:status', {
       id: it.id,
       metrics: {
@@ -1390,7 +1202,6 @@ app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res
       }
     });
 
-    // And full update for listeners that only use idea:update
     sseSend('idea:update', ideaPublic(it));
   };
 
@@ -1402,20 +1213,14 @@ app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res
       String(x.symbol || '').toUpperCase() === symbol &&
       x.status !== 'archived'
     );
-    for (const it of list) {
-      await updateOne(it);
-    }
+    for (const it of list) await updateOne(it);
   } else {
     return err(res, 400, 'provide id or symbol');
   }
 
   if (touched.length) {
     await saveDB(db);
-    return ok(res, {
-      ok:true,
-      updated: touched.length,
-      items: touched
-    });
+    return ok(res, { ok:true, updated: touched.length, items: touched });
   }
 
   return ok(res, { ok:true, updated: 0, items: [] });
@@ -1459,7 +1264,6 @@ app.post('/upload', requireAuth, requireAdmin, (req, res) => {
 });
 
 /* ----------------------- DEBUG -------------------- */
-// lock these behind admin so random members can't poke email config
 app.get('/debug/email/status', requireAuth, requireAdmin, (_req, res) => {
   ok(res, {
     smtp: {
@@ -1492,9 +1296,7 @@ app.post('/debug/email/test', requireAuth, requireAdmin, async (req, res) => {
 
     const toList = splitEmails(rawTo);
     if (!toList.length) {
-      return err(res, 400,
-        'provide ?to= or set EMAIL_FORCE_ALL_TO or EMAIL_BCC_ADMIN'
-      );
+      return err(res, 400, 'provide ?to= or set EMAIL_FORCE_ALL_TO or EMAIL_BCC_ADMIN');
     }
 
     const imgParam = req.query.img || req.body?.img || '';
@@ -1519,12 +1321,7 @@ app.post('/debug/email/test', requireAuth, requireAdmin, async (req, res) => {
       toList
     });
 
-    ok(res, {
-      ok:true,
-      sent: result.sent,
-      via: result.via,
-      img: imgUrl
-    });
+    ok(res, { ok:true, sent: result.sent, via: result.via, img: imgUrl });
   } catch (e) {
     err(res, 500, e.message || 'Test email failed');
   }
