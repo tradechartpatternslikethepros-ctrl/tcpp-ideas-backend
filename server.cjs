@@ -34,6 +34,61 @@ const https = require('https');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
+/* ========= Author / Identity helpers ========= */
+const RESERVED_NAMES = new Set(['api','system','backend','service','member','(user)','trader']);
+
+function sanitizeName(s=''){
+  return String(s)
+    .replace(/[^\p{Letter}\p{Number}\s._-]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60);
+}
+function emailLocal(e=''){
+  const m = String(e).trim().toLowerCase().match(/^([^@]+)/);
+  return m ? m[1] : '';
+}
+
+/** Build req.actor = { id, name, email } from JWT, headers, or body (in that order) */
+function authorInjector(req, _res, next){
+  // Try existing req.user (set by requireAuth), then headers, then body
+  const uj   = req.user || {};
+  const hN   = (req.headers['x-user-name']  || '').toString().trim();
+  const hE   = (req.headers['x-user-email'] || '').toString().trim().toLowerCase();
+  const bN   = (req.body && (req.body.displayName || req.body.authorName || req.body.name) || '').toString().trim();
+  const bE   = (req.body && (req.body.authorEmail || req.body.email) || '').toString().trim().toLowerCase();
+
+  const rawName  = (uj.name || hN || bN || '').trim();
+  const rawEmail = (uj.email || hE || bE || '').trim().toLowerCase();
+
+  let cleanName = sanitizeName(rawName);
+  if(!cleanName || RESERVED_NAMES.has(cleanName.toLowerCase())){
+    cleanName = sanitizeName(emailLocal(rawEmail)) || 'Member';
+  }
+
+  const id =
+    (uj.id && String(uj.id)) ||
+    (rawEmail ? ('email:' + rawEmail) : '') ||
+    ('anon:' + (req.ip||'') + ':' + (req.headers['user-agent']||'').slice(0,24));
+
+  req.actor = { id, name: cleanName, email: rawEmail };
+  next();
+}
+
+/** Ensure outgoing records never leak "api"/blank/garbage author names */
+function normalizeAuthorTriplet(doc){
+  if(!doc) return doc;
+  const nm = sanitizeName(doc.authorName||'');
+  const em = String(doc.authorEmail||'').trim().toLowerCase();
+  let out = nm;
+  if(!out || RESERVED_NAMES.has(out.toLowerCase())){
+    out = sanitizeName(emailLocal(em)) || 'Member';
+  }
+  doc.authorName  = out;
+  doc.authorEmail = em;
+  return doc;
+}
+
 /* ---------------------- ID HELPER ----------------- */
 /* generate short url-safe IDs similar to nanoid */
 function nanoid(size = 12) {
@@ -380,6 +435,7 @@ app.use(cors({
 
 /* body parsing */
 app.use(express.json({ limit: '1mb' }));
+app.use(authorInjector); // <- derives req.actor { id, name, email }
 
 /* static uploads */
 app.use('/uploads', express.static(UPLOAD_DIR, {
@@ -599,7 +655,7 @@ app.get('/ideas/latest', async (req, res) => {
   const items = [...db.ideas]
     .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, limit)
-    .map(ideaPublic);
+    .map(x => ideaPublic(normalizeAuthorTriplet({ ...x })));
   ok(res, { items, ideas: items });
 });
 
@@ -608,29 +664,32 @@ app.get('/ideas/:id', async (req, res) => {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
-  ok(res, { item: ideaPublic(it) });
+  ok(res, { item: ideaPublic(normalizeAuthorTriplet({ ...it })) });
 });
 
 // create idea (admin only)
 app.post('/ideas', requireAuth, requireAdmin, async (req, res) => {
   const db = await loadDB();
 
-  // normalize and force author from req.user, not client
+  // Author comes from req.actor (built by authorInjector), never trust client fields
   const it = normalizeIdea({
     ...req.body,
-    authorId: req.user.id,
-    authorName: req.user.name || 'Member',
-    authorEmail: req.user.email || ''
+    authorId:    req.actor?.id    || req.user?.id || 'anon',
+    authorName:  req.actor?.name  || 'Member',
+    authorEmail: req.actor?.email || ''
   });
 
   if (!it.imageUrl && Array.isArray(it.media) && it.media[0]?.url) {
     it.imageUrl = it.media[0].url;
   }
 
+  // Clean the triplet before storing
+  normalizeAuthorTriplet(it);
+
   db.ideas.unshift(it);
   await saveDB(db);
 
-  const pub = ideaPublic(it);
+  const pub = ideaPublic(normalizeAuthorTriplet({ ...it }));
   sseSend('idea:new', pub);
   ok(res, { item: pub });
 });
@@ -668,7 +727,7 @@ app.patch('/ideas/:id', requireAuth, requireAdmin, async (req, res) => {
 
   await saveDB(db);
 
-  const pub = ideaPublic(it);
+  const pub = ideaPublic(normalizeAuthorTriplet({ ...it }));
   sseSend('idea:update', pub);
   ok(res, { item: pub });
 });
@@ -815,6 +874,10 @@ async function _commentEdit(req, res) {
   if (!it) return err(res, 404, 'Not found');
 
   const all = (it.comments?.items || []);
+  the:
+  {
+    // keep label stable; we only allow edits to text
+  }
   const c = all.find(x => String(x.id) === String(req.params.cid));
   if (!c) return err(res, 404, 'comment not found');
 
