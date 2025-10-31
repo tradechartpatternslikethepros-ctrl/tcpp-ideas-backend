@@ -2,23 +2,17 @@
  * TCPP Ideas Backend — ideas + uploads + likes + comments
  * + live status engine (EL/SL/TPs) + stop/target email triggers
  *
- * This version (updated):
- * - CommonJS, no ESM imports
- * - Uses internal nanoid() (crypto-based) instead of nanoid package
- * - CORS allowlist + referer allowlist for /price/ping
- * - Accepts JWT (Wix member token) in addition to API_TOKEN
- * - 🔐 decodes JWT → req.user {id,email,name,isAdmin}
- * - 🔐 admin gating for create/update/delete ideas, price/ping, email blast, debug email
- * - 🔐 comments:
- *      - store stable authorId + authorName per comment
- *      - authorName now taken from request (body/displayName or x-user-name) before falling back to req.user.name
- *      - authorId stays tied to req.user.id (so users can only edit/delete their own)
- *      - edit/delete still author-only OR admin
- * - comments now return authorId + authorName to the client so the UI can show correct username
- *   and know whether to show Edit/Delete
- * - GET /ideas/latest and GET /ideas/:id now include authorId + authorName per comment
- * - comment add/edit/delete endpoints return the same sanitized shape (id, authorId, authorName, text, createdAt, updatedAt)
- * - safer string trims on req.body
+ * CommonJS, no ESM imports
+ * CORS allowlist + referer allowlist for /price/ping
+ * Accepts JWT (Wix member token) in addition to API_TOKEN
+ * Decodes JWT → req.user {id,email,name,isAdmin}
+ * Admin gating for create/update/delete ideas, price/ping, email blast, debug email
+ * COMMENTS:
+ *   - store authorId + authorName per comment
+ *   - authorName priority: body.displayName/name -> x-user-name -> req.actor.name -> req.user.name -> "Member"
+ *   - authorId from req.user.id (then email) -> anon-*
+ *   - edit/delete: same authorId or admin
+ *   - GET endpoints return authorId + authorName
  */
 
 'use strict';
@@ -51,7 +45,6 @@ function emailLocal(e=''){
 
 /** Build req.actor = { id, name, email } from JWT, headers, or body (in that order) */
 function authorInjector(req, _res, next){
-  // Try existing req.user (set by requireAuth), then headers, then body
   const uj   = req.user || {};
   const hN   = (req.headers['x-user-name']  || '').toString().trim();
   const hE   = (req.headers['x-user-email'] || '').toString().trim().toLowerCase();
@@ -90,7 +83,6 @@ function normalizeAuthorTriplet(doc){
 }
 
 /* ---------------------- ID HELPER ----------------- */
-/* generate short url-safe IDs similar to nanoid */
 function nanoid(size = 12) {
   return crypto.randomBytes(size).toString('base64url').slice(0, size);
 }
@@ -118,9 +110,6 @@ const ALLOWED_UPLOAD_TYPES = (process.env.ALLOWED_UPLOAD_TYPES
 
 const PRICE_STALE_SEC = Number(process.env.PRICE_STALE_SEC || 900);
 
-/* allowlist for /price/ping source (TradingView etc)
-   comma-separated list like: "tradingview.com,*.tradingview.com"
-*/
 const ALLOW_FETCH_REFERERS = (process.env.ALLOW_FETCH_REFERERS || '')
   .split(',')
   .map(s => s.trim().toLowerCase())
@@ -135,7 +124,7 @@ const SMTP_PASS   = process.env.SMTP_PASS   || '';
 
 const MAIL_FROM         = process.env.MAIL_FROM || '';
 const MAIL_FROM_NAME    = process.env.MAIL_FROM_NAME || 'Trade Chart Patterns Like The Pros';
-const EMAIL_FROM        = process.env.EMAIL_FROM || ''; // inline "Name <email>"
+const EMAIL_FROM        = process.env.EMAIL_FROM || '';
 const EMAIL_REPLY_TO    = (process.env.EMAIL_REPLY_TO || '').trim();
 
 const EMAIL_BCC_ADMIN   = (process.env.EMAIL_BCC_ADMIN || '')
@@ -160,13 +149,8 @@ const nowISO = () => new Date().toISOString();
 async function ensureDir(p) {
   await fsp.mkdir(p, { recursive: true }).catch(() => {});
 }
-
-function ok(res, data) {
-  res.json(data);
-}
-function err(res, code, msg) {
-  res.status(code).json({ status:'error', code, message: msg || 'Error' });
-}
+const ok = (res, data) => res.json(data);
+const err = (res, code, msg) => res.status(code).json({ status:'error', code, message: msg || 'Error' });
 
 function absUrl(u) {
   const s = String(u || '').trim();
@@ -252,8 +236,6 @@ function buildMulter() {
 }
 
 /* ---------------------- AUTH ---------------------- */
-
-// read token from header or ?token=
 function readBearer(req) {
   const h = req.headers['authorization'] || req.headers['Authorization'];
   if (h && /^Bearer\s+/i.test(h)) return h.replace(/^Bearer\s+/i, '').trim();
@@ -262,22 +244,11 @@ function readBearer(req) {
 function readQueryToken(req) {
   return (req.query && String(req.query.token || '').trim()) || '';
 }
-
-// decode token -> user object OR null
 function decodeToken(tok) {
   if (!tok) return null;
-
-  // direct API token = god mode/admin
   if (API_TOKEN && tok === API_TOKEN) {
-    return {
-      id: 'api',
-      email: '',
-      name: 'api',
-      isAdmin: true
-    };
+    return { id: 'api', email: '', name: 'api', isAdmin: true };
   }
-
-  // signed Wix member JWT (from getDashboardJWT)
   if (JWT_SECRET) {
     try {
       const decoded = jwt.verify(tok, JWT_SECRET) || {};
@@ -287,86 +258,54 @@ function decodeToken(tok) {
         name: decoded.name || '',
         isAdmin: !!decoded.isAdmin
       };
-    } catch (_) {
-      // bad jwt
-    }
+    } catch (_) {}
   }
-
   return null;
 }
-
-// middleware: attach req.user (and block if invalid)
-// if neither API_TOKEN nor JWT_SECRET is set -> open mode for dev
 function requireAuth(req, res, next) {
   if (!API_TOKEN && !JWT_SECRET) {
     req.user = { id:'open', email:'', name:'open', isAdmin:true };
     return next();
   }
-
   const tok = readBearer(req) || readQueryToken(req);
   const u = decodeToken(tok);
   if (!u) return err(res, 401, 'Unauthorized');
-
   req.user = u;
   next();
 }
-
-// helper: for routes that only admins should hit
 function requireAdmin(req, res, next) {
-  if (!req.user || !req.user.isAdmin) {
-    return err(res, 403, 'forbidden');
-  }
+  if (!req.user || !req.user.isAdmin) return err(res, 403, 'forbidden');
   next();
 }
-
-// SSE auth check (query token only)
 function sseAuthOK(req) {
   if (!API_TOKEN && !JWT_SECRET) return true;
   const tok = readQueryToken(req);
   return !!decodeToken(tok);
 }
 
-/* ----------------- REFERER GUARD ------------------
-   Used ONLY for /price/ping so TradingView etc can hit it,
-   and random strangers can't spam it.
-
-   ALLOW_FETCH_REFERERS can have plain hosts ("tradingview.com")
-   or wildcard ("*.tradingview.com").
----------------------------------------------------*/
+/* ----------------- REFERER GUARD ------------------ */
 function wildcardToRegex(pattern) {
   let esc = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
   esc = esc.replace(/\\\*/g, '.*');
   return new RegExp('^' + esc + '$', 'i');
 }
-
 const ALLOWED_REF_REGEXES = ALLOW_FETCH_REFERERS.map(p => {
   try { return wildcardToRegex(p); } catch { return null; }
 }).filter(Boolean);
-
 function getRefHost(req) {
   const ref = String(req.headers['referer'] || req.headers['origin'] || '').trim();
   if (!ref) return '';
   try {
     const u = new URL(ref);
     return u.hostname.toLowerCase();
-  } catch {
-    return '';
-  }
+  } catch { return ''; }
 }
-
 function checkReferer(req, res, next) {
-  if (!ALLOWED_REF_REGEXES.length) {
-    // nothing configured -> allow everyone
-    return next();
-  }
+  if (!ALLOWED_REF_REGEXES.length) return next();
   const host = getRefHost(req);
-  if (!host) {
-    return err(res, 403, 'Forbidden (no referer)');
-  }
+  if (!host) return err(res, 403, 'Forbidden (no referer)');
   const pass = ALLOWED_REF_REGEXES.some(rx => rx.test(host));
-  if (!pass) {
-    return err(res, 403, 'Forbidden referer');
-  }
+  if (!pass) return err(res, 403, 'Forbidden referer');
   next();
 }
 
@@ -374,9 +313,7 @@ function checkReferer(req, res, next) {
 const clients = new Set(); // { id, res, ping }
 function sseSend(event, data) {
   const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const c of clients) {
-    try { c.res.write(line); } catch { /* ignore */ }
-  }
+  for (const c of clients) { try { c.res.write(line); } catch {} }
 }
 function sseSendTo(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -387,100 +324,60 @@ const app = express();
 
 /* ----- CORS allow logic ----- */
 function isOriginAllowed(origin) {
-  if (!origin) return true; // no Origin header -> allow (curl / server2server)
-
+  if (!origin) return true;
   if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return true;
-
   try {
     const { protocol, host } = new URL(origin);
-
-    // wix editor/preview
-    if (host.endsWith('.wixsite.com')) {
-      return protocol === 'https:';
-    }
-
-    // Wix CDN/media
-    if (host.endsWith('.filesusr.com')) {
-      return protocol === 'https:';
-    }
-
-    // wildcard like https://*.wixsite.com
+    if (host.endsWith('.wixsite.com')) return protocol === 'https:';
+    if (host.endsWith('.filesusr.com')) return protocol === 'https:';
     for (const pat of CORS_ORIGINS) {
       if (!pat.includes('*')) continue;
       const m = pat.match(/^https?:\/\/\*\.(.+)$/i);
-      if (m && host.endsWith(m[1])) {
-        return protocol === 'https:';
-      }
+      if (m && host.endsWith(m[1])) return protocol === 'https:';
     }
-
-    // localhost dev
     if (/^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host)) return true;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
   return false;
 }
-
-/* CORS middleware */
 app.use(cors({
   origin: (origin, cb) => {
     const allowed = isOriginAllowed(origin);
-    if (!allowed) {
-      console.error(`CORS blocked: ${origin}`);
-    }
+    if (!allowed) console.error(`CORS blocked: ${origin}`);
     cb(null, allowed);
   },
   credentials: false
 }));
 
-/* body parsing */
+/* body parsing + identity */
 app.use(express.json({ limit: '1mb' }));
-app.use(authorInjector); // <- derives req.actor { id, name, email }
+app.use(authorInjector);
 
 /* static uploads */
 app.use('/uploads', express.static(UPLOAD_DIR, {
   index: false,
   maxAge: '30d',
-  setHeaders: res => {
-    // so images can be embedded on wix site etc
-    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  }
+  setHeaders: res => { res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin'); }
 }));
 
 /* ---------------------- HEALTH ------------------- */
-app.get('/health', (_req, res) => ok(res, {
-  ok: true,
-  env: NODE_ENV,
-  time: nowISO()
-}));
+app.get('/health', (_req, res) => ok(res, { ok: true, env: NODE_ENV, time: nowISO() }));
 
 /* ---------------------- EVENTS (SSE) ------------- */
 app.get('/events', (req, res) => {
   if (!sseAuthOK(req)) return err(res, 401, 'Unauthorized');
-
   res.set({
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no'
   });
-
   if (res.flushHeaders) res.flushHeaders();
-
   const id = nanoid(10);
   const client = { id, res, ping: null };
   clients.add(client);
-
   sseSendTo(res, 'hello', { id, at: nowISO() });
-
-  client.ping = setInterval(() => {
-    try { res.write(': ping\n\n'); } catch {}
-  }, 25000);
-
-  req.on('close', () => {
-    clearInterval(client.ping);
-    clients.delete(client);
-  });
+  client.ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
+  req.on('close', () => { clearInterval(client.ping); clients.delete(client); });
 });
 
 /* -------------------- NORMALIZATION -------------- */
@@ -490,13 +387,11 @@ function normalizeDirection(v) {
   if (s === 'short' || s === 'sell') return 'short';
   return 'neutral';
 }
-
 function firstImageUrl(item) {
   const raw = item?.imageUrl ||
     (Array.isArray(item?.media) && item.media[0] && item.media[0].url) || '';
   return absUrl(raw);
 }
-
 function ideaDeepLink(item) {
   const base = `${SITE_URL}/trading-dashboard`;
   const id   = String(item?.id || '').trim();
@@ -505,7 +400,6 @@ function ideaDeepLink(item) {
   const q = `?idea=${encodeURIComponent(id)}&utm_source=email&utm_medium=notification&utm_campaign=${encodeURIComponent(campaign)}`;
   return `${base}${q}`;
 }
-
 function normalizeIdea(input) {
   const now = nowISO();
   const dir = normalizeDirection(input.direction || input.bias);
@@ -533,7 +427,7 @@ function normalizeIdea(input) {
       targets: targets,
       last: null,
       lastAt: null,
-      statusLight: 'gray', // gray|green|orange|red|blue
+      statusLight: 'gray',
       statusNote: '',
       hitStop: false,
       hitTargetIndex: null,
@@ -548,8 +442,6 @@ function normalizeIdea(input) {
     updatedAt: now
   };
 }
-
-// sanitize idea for public / frontend
 function ideaPublic(it) {
   return {
     id: it.id,
@@ -577,6 +469,7 @@ function ideaPublic(it) {
         : null
     } : undefined,
     authorName: it.authorName,
+    authorEmail: it.authorEmail,
     createdAt: it.createdAt,
     updatedAt: it.updatedAt,
     likeCount: it.likes?.count || 0,
@@ -585,7 +478,7 @@ function ideaPublic(it) {
       items: (it.comments?.items || []).map(c => ({
         id: c.id,
         authorId: c.authorId || '',
-        authorName: c.authorName || 'Member',
+        authorName: sanitizeName(c.authorName || 'Member'),
         text: c.text,
         createdAt: c.createdAt,
         updatedAt: c.updatedAt
@@ -607,9 +500,7 @@ function evalStatus(idea){
   let statusNote  = 'No price/entry';
 
   if (!Number.isFinite(p) || !Number.isFinite(el)) {
-    m.statusLight = 'gray';
-    m.statusNote  = statusNote;
-    return m;
+    m.statusLight = 'gray'; m.statusNote  = statusNote; return m;
   }
 
   const firstTarget = tgs.length ? tgs[0] : null;
@@ -620,22 +511,16 @@ function evalStatus(idea){
     } else if (Number.isFinite(firstTarget) && p >= firstTarget) {
       statusLight='blue'; statusNote='Target reached';
       if (m.hitTargetIndex == null) m.hitTargetIndex = 0;
-    } else if (p >= el) {
-      statusLight='green'; statusNote='Above EL';
-    } else {
-      statusLight='orange'; statusNote='Below EL';
-    }
+    } else if (p >= el) { statusLight='green'; statusNote='Above EL'; }
+    else { statusLight='orange'; statusNote='Below EL'; }
   } else if (dir === 'short') {
     if (Number.isFinite(sl) && p >= sl) {
       statusLight='red';  statusNote='Stop hit'; m.hitStop = true;
     } else if (Number.isFinite(firstTarget) && p <= firstTarget) {
       statusLight='blue'; statusNote='Target reached';
       if (m.hitTargetIndex == null) m.hitTargetIndex = 0;
-    } else if (p <= el) {
-      statusLight='green'; statusNote='Below EL';
-    } else {
-      statusLight='orange'; statusNote='Above EL';
-    }
+    } else if (p <= el) { statusLight='green'; statusNote='Below EL'; }
+    else { statusLight='orange'; statusNote='Above EL'; }
   } else {
     statusLight='orange'; statusNote='Neutral';
   }
@@ -646,8 +531,6 @@ function evalStatus(idea){
 }
 
 /* -------------------- IDEAS CRUD ------------------ */
-
-// public latest feed
 app.get('/ideas/latest', async (req, res) => {
   const limit = Math.min(Number(req.query.limit || 30), 100);
   const db = await loadDB();
@@ -657,43 +540,28 @@ app.get('/ideas/latest', async (req, res) => {
     .map(x => ideaPublic(normalizeAuthorTriplet({ ...x })));
   ok(res, { items, ideas: items });
 });
-
-// public single idea
 app.get('/ideas/:id', async (req, res) => {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
   ok(res, { item: ideaPublic(normalizeAuthorTriplet({ ...it })) });
 });
-
-// create idea (admin only)
 app.post('/ideas', requireAuth, requireAdmin, async (req, res) => {
   const db = await loadDB();
-
-  // Author comes from req.actor (built by authorInjector), never trust client fields
   const it = normalizeIdea({
     ...req.body,
     authorId:    req.actor?.id    || req.user?.id || 'anon',
     authorName:  req.actor?.name  || 'Member',
     authorEmail: req.actor?.email || ''
   });
-
-  if (!it.imageUrl && Array.isArray(it.media) && it.media[0]?.url) {
-    it.imageUrl = it.media[0].url;
-  }
-
-  // Clean the triplet before storing
+  if (!it.imageUrl && Array.isArray(it.media) && it.media[0]?.url) it.imageUrl = it.media[0].url;
   normalizeAuthorTriplet(it);
-
   db.ideas.unshift(it);
   await saveDB(db);
-
   const pub = ideaPublic(normalizeAuthorTriplet({ ...it }));
   sseSend('idea:new', pub);
   ok(res, { item: pub });
 });
-
-// update idea (admin only)
 app.patch('/ideas/:id', requireAuth, requireAdmin, async (req, res) => {
   const db = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
@@ -723,15 +591,11 @@ app.patch('/ideas/:id', requireAuth, requireAdmin, async (req, res) => {
     it.metrics.targets = parseTargets(req.body.targets ?? req.body.targetText ?? req.body.tp ?? req.body.tps);
 
   evalStatus(it);
-
   await saveDB(db);
-
   const pub = ideaPublic(normalizeAuthorTriplet({ ...it }));
   sseSend('idea:update', pub);
   ok(res, { item: pub });
 });
-
-// delete idea (admin only)
 app.delete('/ideas/:id', requireAuth, requireAdmin, async (req, res) => {
   const db = await loadDB();
   const idx = db.ideas.findIndex(x => String(x.id) === String(req.params.id));
@@ -751,7 +615,6 @@ async function likeHandler(req, res) {
 
   const action = String(req.body?.action || req.body?.op || '').toLowerCase();
 
-  // prefer trusted identity from req.user
   const fallbackUserId = (req.user?.email || req.user?.id || 'device').slice(0,120);
   const fallbackName   = (req.user?.name || 'Member').slice(0,120);
 
@@ -777,72 +640,46 @@ async function likeHandler(req, res) {
   const out = { id: it.id, likeCount: it.likes.count };
   sseSend('likes:update', out);
 
-  ok(res, {
-    likeCount: it.likes.count,
-    likes: { count: it.likes.count }
-  });
+  ok(res, { likeCount: it.likes.count, likes: { count: it.likes.count } });
 }
-
 app.put('/ideas/:id/likes', requireAuth, likeHandler);
 app.post('/ideas/:id/likes', requireAuth, likeHandler);
 app.put('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 app.post('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 
-/* -------------------- COMMENTS --------------------
-   IMPORTANT CHANGES:
-   - We now store both authorId and authorName on each comment.
-   - authorName priority:
-        req.body.displayName / req.body.name
-     -> req.headers['x-user-name']
-     -> req.user.name
-     -> "Member"
-   - authorId priority:
-        req.user.id
-     -> req.user.email
-     -> fallback anon-<nanoid>
-   We NEVER overwrite authorId/authorName on edit. We only let the
-   same authorId (or admin) edit/delete.
----------------------------------------------------*/
-
+/* -------------------- COMMENTS -------------------- */
 function sanitizeCommentsArray(arr) {
   return (arr || []).map(x => ({
     id: x.id,
     authorId: x.authorId || '',
-    authorName: x.authorName || 'Member',
+    authorName: sanitizeName(x.authorName || 'Member'),
     text: x.text,
     createdAt: x.createdAt,
     updatedAt: x.updatedAt
   }));
 }
 
+// ⬇️ FIXED: prefers body/displayName -> x-user-name -> req.actor.name -> req.user.name
 async function _commentAdd(req, res) {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
 
   const rawText = (
-    (req.body && (req.body.text || req.body.body || req.body.comment || req.body.msg)) ||
-    ''
+    (req.body && (req.body.text || req.body.body || req.body.comment || req.body.msg)) || ''
   ).toString().trim();
   if (!rawText) return err(res, 400, 'text required');
 
-  // derive identity
   const headerName  = (req.headers['x-user-name']  || '').toString().trim();
   const headerEmail = (req.headers['x-user-email'] || '').toString().trim();
 
-  // stable authorId primarily from req.user
   const authorId = (
-    (req.user?.id || req.user?.email || headerEmail || '')
-      .toString()
-      .slice(0,120)
+    (req.user?.id || req.user?.email || headerEmail || '').toString().slice(0,120)
   ) || ('anon-' + nanoid(6));
 
-  // display name priority (client wins for label, but perms still use authorId)
-  const derivedName = (
-    (req.body?.displayName || req.body?.name || headerName || req.user?.name || 'Member')
-      .toString()
-      .trim()
-  ).slice(0,120) || 'Member';
+  const derivedNameRaw =
+    (req.body?.displayName || req.body?.name || headerName || req.actor?.name || req.user?.name || 'Member');
+  const derivedName = sanitizeName(String(derivedNameRaw)).slice(0,120) || 'Member';
 
   const now = nowISO();
   const c = {
@@ -860,10 +697,7 @@ async function _commentAdd(req, res) {
   await saveDB(db);
 
   const items = sanitizeCommentsArray(it.comments.items);
-
-  // SSE update with sanitized items
   sseSend('comments:update', { id: it.id, items });
-
   ok(res, { items });
 }
 
@@ -873,17 +707,14 @@ async function _commentEdit(req, res) {
   if (!it) return err(res, 404, 'Not found');
 
   const all = (it.comments?.items || []);
-  // keep label stable; we only allow edits to text
   const c = all.find(x => String(x.id) === String(req.params.cid));
   if (!c) return err(res, 404, 'comment not found');
 
-  // authz: admin OR same author
   const canEdit = (req.user?.isAdmin || (req.user?.id && req.user.id === c.authorId));
   if (!canEdit) return err(res, 403, 'forbidden');
 
   const rawText = (
-    (req.body && (req.body.text || req.body.body || req.body.comment || req.body.msg)) ||
-    ''
+    (req.body && (req.body.text || req.body.body || req.body.comment || req.body.msg)) || ''
   ).toString().trim();
   if (!rawText) return err(res, 400, 'text required');
 
@@ -893,7 +724,6 @@ async function _commentEdit(req, res) {
   await saveDB(db);
 
   const items = sanitizeCommentsArray(it.comments.items);
-
   sseSend('comments:update', { id: it.id, items });
   ok(res, { items });
 }
@@ -907,7 +737,6 @@ async function _commentDelete(req, res) {
   const target = beforeList.find(x => String(x.id) === String(req.params.cid));
   if (!target) return err(res, 404, 'comment not found');
 
-  // authz: admin OR same author
   const canDelete = (req.user?.isAdmin || (req.user?.id && req.user.id === target.authorId));
   if (!canDelete) return err(res, 403, 'forbidden');
 
@@ -916,11 +745,9 @@ async function _commentDelete(req, res) {
   await saveDB(db);
 
   const items = sanitizeCommentsArray(it.comments.items);
-
   sseSend('comments:update', { id: it.id, items });
   ok(res, { items });
 }
-
 app.post('/ideas/:id/comments', requireAuth, _commentAdd);
 app.patch('/ideas/:id/comments/:cid', requireAuth, _commentEdit);
 app.delete('/ideas/:id/comments/:cid', requireAuth, _commentDelete);
@@ -929,7 +756,6 @@ app.delete('/ideas/:id/comments/:cid', requireAuth, _commentDelete);
 function smtpReady() {
   return !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true));
 }
-
 let transporter = null;
 function getTransporter() {
   if (!smtpReady()) return null;
@@ -945,14 +771,12 @@ function getTransporter() {
   });
   return transporter;
 }
-
 function fromHeader() {
   if (EMAIL_FROM) return EMAIL_FROM;
   if (MAIL_FROM) return `"${MAIL_FROM_NAME}" <${MAIL_FROM}>`;
   if (SMTP_USER) return `"${MAIL_FROM_NAME}" <${SMTP_USER}>`;
   return `"${MAIL_FROM_NAME}" <no-reply@localhost>`;
 }
-
 const EMAIL_RX_LOCAL = EMAIL_RX;
 function splitEmails(list) {
   return String(list || '')
@@ -961,21 +785,16 @@ function splitEmails(list) {
     .filter(Boolean)
     .filter(e => EMAIL_RX_LOCAL.test(e));
 }
-
 function packToBcc(all) {
   const uniqd = uniq(all);
-  if (uniqd.length <= 1) {
-    return { to: uniqd[0] || undefined, bcc: undefined };
-  }
+  if (uniqd.length <= 1) return { to: uniqd[0] || undefined, bcc: undefined };
   return { to: uniqd[0], bcc: uniqd.slice(1) };
 }
-
 function _esc(s) {
   return String(s || '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
-
 function _bullets(s) {
   const parts = String(s || '')
     .split(/\r?\n|[;•]\s*/g)
@@ -986,19 +805,8 @@ function _bullets(s) {
     ${parts.map(li => `<li style="margin:6px 0;line-height:1.45">${_esc(li)}</li>`).join('')}
   </ul>`;
 }
-
 function _emailShell({
-  preheader,
-  title,
-  symbol,
-  levelsHTML,
-  planHTML,
-  imgUrl,
-  ctaHref,
-  ctaText,
-  badgeText,
-  theme,
-  statusColor
+  preheader, title, symbol, levelsHTML, planHTML, imgUrl, ctaHref, ctaText, badgeText, theme, statusColor
 }) {
   const isClear = ['clear','transparent','none','minimal','white'].includes(theme);
   const logo = absUrl(LOGO_URL);
@@ -1084,7 +892,6 @@ function _emailShell({
   </table>
 </body></html>`;
 }
-
 function emailTemplatePost(item) {
   const title   = item?.title || 'New Idea';
   const symbol  = item?.symbol || '';
@@ -1096,23 +903,19 @@ function emailTemplatePost(item) {
 
   const html = _emailShell({
     preheader: `New Idea — ${pre}`,
-    title,
-    symbol,
+    title, symbol,
     levelsHTML: levels,
     planHTML: plan,
-    imgUrl,
+    imgUrl: imgUrl,
     ctaHref: deepURL,
     ctaText: 'Open on Dashboard',
     badgeText: '🔔 New Idea',
     theme: EMAIL_THEME
   });
-
   const subject = `🔔 New Idea: ${symbol ? `${symbol} — `:''}${title || 'Update'}`;
-
   return { subject, html };
 }
-
-function emailTemplateStatus(item, kind /* 'stop' | 'target' */, info) {
+function emailTemplateStatus(item, kind, info) {
   const title   = item?.title || '';
   const symbol  = item?.symbol || '';
   const levels  = _bullets(item?.levelText || item?.levels || '');
@@ -1121,63 +924,33 @@ function emailTemplateStatus(item, kind /* 'stop' | 'target' */, info) {
   const deepURL = ideaDeepLink(item);
 
   const color   = kind==='stop' ? '#ff335a' : '#2fa8ff';
-  const badge   = kind==='stop'
-    ? '🟥 Stop Hit'
-    : `🟦 Target ${info?.label||''} Hit`;
-
-  const subj    = kind==='stop'
-    ? `🟥 STOP: ${symbol} — ${title}`
-    : `🟦 TARGET: ${symbol} — ${title}`;
+  const badge   = kind==='stop' ? '🟥 Stop Hit' : `🟦 Target ${info?.label||''} Hit`;
+  const subj    = kind==='stop' ? `🟥 STOP: ${symbol} — ${title}` : `🟦 TARGET: ${symbol} — ${title}`;
 
   const html = _emailShell({
     preheader: subj,
-    title,
-    symbol,
-    levelsHTML: levels,
-    planHTML: plan,
-    imgUrl,
-    ctaHref: deepURL,
-    ctaText: 'Open on Dashboard',
-    badgeText: badge,
-    theme: EMAIL_THEME,
-    statusColor: color
+    title, symbol, levelsHTML: levels, planHTML: plan, imgUrl,
+    ctaHref: deepURL, ctaText: 'Open on Dashboard',
+    badgeText: badge, theme: EMAIL_THEME, statusColor: color
   });
-
   return { subject: subj, html };
 }
-
 async function recipientsFor(reqBody){
-  // 1. EMAIL_FORCE_ALL_TO overrides everything (great for testing)
   const forced = splitEmails(EMAIL_FORCE_ALL_TO);
   if (forced.length) return { list: forced, mode:'forced' };
-
-  // 2. active subscribers
   const subs = await loadSubs().catch(()=>blankSubs());
   const list = uniq((subs.subs||[])
     .map(s=>String(s.email||'').toLowerCase())
-    .filter(e=>EMAIL_RX_LOCAL.test(e)));
+    .filter(e=>EMAIL_RX.test(e)));
   if (list.length) return { list, mode:'subs' };
-
-  // 3. actor email (fallback for manual post)
   const actorEmail = String(reqBody?.actor?.email || reqBody?.actorEmail || '')
-    .trim()
-    .toLowerCase();
-  if (EMAIL_RX_LOCAL.test(actorEmail)) return { list:[actorEmail], mode:'actor' };
-
-  // 4. admin BCC only
-  const admins = (EMAIL_BCC_ADMIN || []).filter(e => EMAIL_RX_LOCAL.test(e));
-  return admins.length
-    ? { list: admins, mode:'admin' }
-    : { list: [], mode:'none' };
+    .trim().toLowerCase();
+  if (EMAIL_RX.test(actorEmail)) return { list:[actorEmail], mode:'actor' };
+  const admins = (EMAIL_BCC_ADMIN || []).filter(e => EMAIL_RX.test(e));
+  return admins.length ? { list: admins, mode:'admin' } : { list: [], mode:'none' };
 }
-
-function getMailer(){
-  if (!smtpReady()) return null;
-  return getTransporter();
-}
-
+function getMailer(){ if (!smtpReady()) return null; return getTransporter(); }
 async function sendEmailBlast({ subject, html, toList }){
-  // Try SMTP first
   try{
     const tx = getMailer();
     if (tx && toList.length){
@@ -1191,46 +964,32 @@ async function sendEmailBlast({ subject, html, toList }){
         from,
         to: to || undefined,
         bcc: finalBcc.length ? finalBcc : undefined,
-        subject,
-        html,
-        replyTo
+        subject, html, replyTo
       });
-
-      return {
-        sent: toList.length,
-        messageId: info?.messageId || '',
-        via:'smtp'
-      };
+      return { sent: toList.length, messageId: info?.messageId || '', via:'smtp' };
     }
   }catch(e){
     console.warn('[email][smtp] failed, trying HTTP fallback:', e?.message || e);
   }
 
-  // Fallback: Mailjet REST API using SMTP_USER/SMTP_PASS
   if (!(SMTP_USER && SMTP_PASS)) throw new Error('No SMTP creds for HTTP fallback');
   if (!toList.length) return { sent:0, via:'http' };
 
   const payload = {
     Messages: [{
-      From: {
-        Email: (MAIL_FROM || SMTP_USER),
-        Name: MAIL_FROM_NAME || 'Notifier'
-      },
+      From: { Email: (MAIL_FROM || SMTP_USER), Name: MAIL_FROM_NAME || 'Notifier' },
       To: toList.map(e => ({ Email: e })),
       Subject: subject,
       HTMLPart: html,
       Headers: EMAIL_REPLY_TO ? { 'Reply-To': EMAIL_REPLY_TO } : undefined
     }]
   };
-
   const auth = Buffer.from(`${SMTP_USER}:${SMTP_PASS}`).toString('base64');
   const body = JSON.stringify(payload);
 
   const httpResult = await new Promise((resolve, reject)=>{
     const req = https.request({
-      method: 'POST',
-      host: 'api.mailjet.com',
-      path: '/v3.1/send',
+      method: 'POST', host: 'api.mailjet.com', path: '/v3.1/send',
       headers: {
         'Authorization': `Basic ${auth}`,
         'Content-Type': 'application/json',
@@ -1238,8 +997,7 @@ async function sendEmailBlast({ subject, html, toList }){
       },
       timeout: 12000
     }, res=>{
-      let data='';
-      res.on('data', c=> data+=c);
+      let data=''; res.on('data', c=> data+=c);
       res.on('end', ()=>{
         if (res.statusCode >= 200 && res.statusCode < 300) {
           resolve({ ok:true, status: res.statusCode, body: data });
@@ -1250,77 +1008,42 @@ async function sendEmailBlast({ subject, html, toList }){
     });
     req.on('timeout', ()=>{ req.destroy(new Error('Mailjet HTTP timeout')); });
     req.on('error', reject);
-    req.write(body);
-    req.end();
+    req.write(body); req.end();
   });
-
   return { sent: toList.length, via: 'http', raw: httpResult.status };
 }
 
 /* ---------------------- EMAIL ROUTES ------------- */
-// email blast to subs (admin only)
 app.post('/email/post', requireAuth, requireAdmin, async (req, res) => {
   try{
     const item = req.body?.item || req.body?.data || null;
     if (!item) return err(res, 400, 'item required');
 
     const { list, mode } = await recipientsFor(req.body || {});
-    if (!list.length) {
-      return ok(res, {
-        ok:true,
-        sent:0,
-        info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)'
-      });
-    }
+    if (!list.length) return ok(res, { ok:true, sent:0, info:'no recipients (set EMAIL_FORCE_ALL_TO or add subscribers)' });
 
     const tpl = emailTemplatePost(item);
-    const result = await sendEmailBlast({
-      subject: tpl.subject,
-      html: tpl.html,
-      toList:list
-    });
-
+    const result = await sendEmailBlast({ subject: tpl.subject, html: tpl.html, toList:list });
     ok(res, { ok:true, sent: result.sent, mode, via: result.via });
-  }catch(e){
-    err(res, 500, e.message || 'Email failed');
-  }
+  }catch(e){ err(res, 500, e.message || 'Email failed'); }
 });
 
 /* ---------------------- STATUS EMAIL TRIGGERS ----- */
-async function maybeNotify(idea, reason /* 'stop' | 'target' */, info) {
+async function maybeNotify(idea, reason, info) {
   try{
     const { list } = await recipientsFor({});
     if (!list.length) return;
     const tpl = emailTemplateStatus(idea, reason, info);
-    await sendEmailBlast({
-      subject: tpl.subject,
-      html: tpl.html,
-      toList: list
-    });
-  } catch (e){
-    console.warn('[notify]', reason, idea?.id, e?.message || e);
-  }
+    await sendEmailBlast({ subject: tpl.subject, html: tpl.html, toList: list });
+  } catch (e){ console.warn('[notify]', reason, idea?.id, e?.message || e); }
 }
 
-/* ---------------------- PRICE PING ----------------
- * POST /price/ping
- *  body: { symbol?: string, id?: string, price: number, at?: ISO }
- *  - If id present -> update that idea
- *  - else update ALL live ideas matching symbol
- *  - Triggers SSE idea:status + idea:update
- *  - Fires email once on stop/target hit
- *
- * We ALSO gate this route with checkReferer() so only approved
- * referers/origins (tradingview etc.) can hit it in production.
- *
- * 🔐 requireAdmin: only admin/api token should be allowed to move live prices.
- ---------------------------------------------------*/
+/* ---------------------- PRICE PING ---------------- */
 app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res) => {
   const price  = nnum(req.body?.price);
   const at     = String(req.body?.at || nowISO());
   const symbol = String(req.body?.symbol || '').trim().toUpperCase();
   const id     = String(req.body?.id || '').trim();
-
   if (!Number.isFinite(price)) return err(res, 400, 'price required');
 
   const db = await loadDB();
@@ -1333,29 +1056,20 @@ app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res
 
     evalStatus(it);
 
-    // Track first target hit
     const dir = it.direction || 'neutral';
-    const tgs = Array.isArray(it.metrics.targets)
-      ? it.metrics.targets.map(Number)
-      : [];
+    const tgs = Array.isArray(it.metrics.targets) ? it.metrics.targets.map(Number) : [];
 
     if (tgs.length) {
       if (dir === 'long') {
         const idx = tgs.findIndex(tp => Number.isFinite(tp) && price >= tp);
-        if (idx >= 0 && (it.metrics.hitTargetIndex == null || idx < it.metrics.hitTargetIndex)) {
-          it.metrics.hitTargetIndex = idx;
-        }
+        if (idx >= 0 && (it.metrics.hitTargetIndex == null || idx < it.metrics.hitTargetIndex)) it.metrics.hitTargetIndex = idx;
       } else if (dir === 'short') {
         const idx = tgs.findIndex(tp => Number.isFinite(tp) && price <= tp);
-        if (idx >= 0 && (it.metrics.hitTargetIndex == null || idx < it.metrics.hitTargetIndex)) {
-          it.metrics.hitTargetIndex = idx;
-        }
+        if (idx >= 0 && (it.metrics.hitTargetIndex == null || idx < it.metrics.hitTargetIndex)) it.metrics.hitTargetIndex = idx;
       }
     }
 
-    // Notify once
     it.metrics.notified ||= { stop:false, targets:{} };
-
     if (it.metrics.statusLight === 'red' && !it.metrics.notified.stop) {
       it.metrics.notified.stop = true;
       await maybeNotify(it, 'stop');
@@ -1364,16 +1078,12 @@ app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res
       !it.metrics.notified.targets[it.metrics.hitTargetIndex]
     ) {
       it.metrics.notified.targets[it.metrics.hitTargetIndex] = true;
-      await maybeNotify(it, 'target', {
-        index: it.metrics.hitTargetIndex,
-        label: `T${it.metrics.hitTargetIndex+1}`
-      });
+      await maybeNotify(it, 'target', { index: it.metrics.hitTargetIndex, label: `T${it.metrics.hitTargetIndex+1}` });
     }
 
     it.updatedAt = nowISO();
     touched.push(ideaPublic(it));
 
-    // Push SSE quick status
     sseSend('idea:status', {
       id: it.id,
       metrics: {
@@ -1385,8 +1095,6 @@ app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res
         hitTargetIndex: it.metrics.hitTargetIndex ?? null
       }
     });
-
-    // And full update for listeners that only use idea:update
     sseSend('idea:update', ideaPublic(it));
   };
 
@@ -1398,22 +1106,15 @@ app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res
       String(x.symbol || '').toUpperCase() === symbol &&
       x.status !== 'archived'
     );
-    for (const it of list) {
-      await updateOne(it);
-    }
+    for (const it of list) await updateOne(it);
   } else {
     return err(res, 400, 'provide id or symbol');
   }
 
   if (touched.length) {
     await saveDB(db);
-    return ok(res, {
-      ok:true,
-      updated: touched.length,
-      items: touched
-    });
+    return ok(res, { ok:true, updated: touched.length, items: touched });
   }
-
   return ok(res, { ok:true, updated: 0, items: [] });
 });
 
@@ -1421,24 +1122,14 @@ app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res
 async function subscribeCore(email, name) {
   const s = await loadSubs();
   const exists = (s.subs || []).find(x => x.email === email);
-  if (!exists) {
-    (s.subs ||= []).push({
-      email,
-      name,
-      createdAt: nowISO(),
-      status: 'active'
-    });
-  }
+  if (!exists) { (s.subs ||= []).push({ email, name, createdAt: nowISO(), status: 'active' }); }
   await saveSubs(s);
   return { ok: true };
 }
-
 app.post('/subscribe', requireAuth, async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const name  = String(req.body?.name || 'Member').trim();
-  if (!email || !EMAIL_RX_LOCAL.test(email)) {
-    return err(res, 400, 'Valid email required');
-  }
+  if (!email || !EMAIL_RX.test(email)) return err(res, 400, 'Valid email required');
   const out = await subscribeCore(email, name);
   ok(res, out);
 });
@@ -1455,43 +1146,26 @@ app.post('/upload', requireAuth, requireAdmin, (req, res) => {
 });
 
 /* ----------------------- DEBUG -------------------- */
-// lock these behind admin so random members can't poke email config
 app.get('/debug/email/status', requireAuth, requireAdmin, (_req, res) => {
   ok(res, {
     smtp: {
       ready: !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true)),
-      host: SMTP_HOST || null,
-      port: SMTP_PORT || null,
-      secure: SMTP_SECURE,
-      hasUser: !!SMTP_USER,
-      hasPass: !!SMTP_PASS,
+      host: SMTP_HOST || null, port: SMTP_PORT || null, secure: SMTP_SECURE,
+      hasUser: !!SMTP_USER, hasPass: !!SMTP_PASS,
     },
     branding: {
-      siteUrl: SITE_URL,
-      logo: LOGO_URL,
-      from: fromHeader(),
-      bccAdmins: EMAIL_BCC_ADMIN,
-      forceTo: EMAIL_FORCE_ALL_TO || null,
+      siteUrl: SITE_URL, logo: LOGO_URL, from: fromHeader(),
+      bccAdmins: EMAIL_BCC_ADMIN, forceTo: EMAIL_FORCE_ALL_TO || null,
       uploadsPublicBaseUrl: UPLOADS_PUBLIC_BASE_URL || null,
-      assetBaseUrl: ASSET_BASE_URL,
-      emailTheme: EMAIL_THEME
+      assetBaseUrl: ASSET_BASE_URL, emailTheme: EMAIL_THEME
     }
   });
 });
-
 app.post('/debug/email/test', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const rawTo = req.query.to
-      || req.body?.to
-      || EMAIL_FORCE_ALL_TO
-      || (EMAIL_BCC_ADMIN || []).join(',');
-
+    const rawTo = req.query.to || req.body?.to || EMAIL_FORCE_ALL_TO || (EMAIL_BCC_ADMIN || []).join(',');
     const toList = splitEmails(rawTo);
-    if (!toList.length) {
-      return err(res, 400,
-        'provide ?to= or set EMAIL_FORCE_ALL_TO or EMAIL_BCC_ADMIN'
-      );
-    }
+    if (!toList.length) return err(res, 400, 'provide ?to= or set EMAIL_FORCE_ALL_TO or EMAIL_BCC_ADMIN');
 
     const imgParam = req.query.img || req.body?.img || '';
     const imgUrl   = absUrl(imgParam);
@@ -1515,15 +1189,8 @@ app.post('/debug/email/test', requireAuth, requireAdmin, async (req, res) => {
       toList
     });
 
-    ok(res, {
-      ok:true,
-      sent: result.sent,
-      via: result.via,
-      img: imgUrl
-    });
-  } catch (e) {
-    err(res, 500, e.message || 'Test email failed');
-  }
+    ok(res, { ok:true, sent: result.sent, via: result.via, img: imgUrl });
+  } catch (e) { err(res, 500, e.message || 'Test email failed'); }
 });
 
 /* ----------------------- START -------------------- */
