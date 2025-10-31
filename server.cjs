@@ -577,7 +577,6 @@ function ideaPublic(it) {
         : null
     } : undefined,
     authorName: it.authorName,
-    authorEmail: it.authorEmail,
     createdAt: it.createdAt,
     updatedAt: it.updatedAt,
     likeCount: it.likes?.count || 0,
@@ -874,10 +873,7 @@ async function _commentEdit(req, res) {
   if (!it) return err(res, 404, 'Not found');
 
   const all = (it.comments?.items || []);
-  the:
-  {
-    // keep label stable; we only allow edits to text
-  }
+  // keep label stable; we only allow edits to text
   const c = all.find(x => String(x.id) === String(req.params.cid));
   if (!c) return err(res, 404, 'comment not found');
 
