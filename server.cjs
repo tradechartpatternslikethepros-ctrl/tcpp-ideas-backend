@@ -1,13 +1,24 @@
 /* server.cjs
  * TCPP Ideas Backend — ideas + uploads + likes + comments
- * + email blast + SSE updates
+ * + live status engine (EL/SL/TPs) + stop/target email triggers
  *
- * This version (price features removed):
- * - NO /price/ping route
- * - NO referer allowlist/checker for price
- * - Kept ideas CRUD, uploads, likes, comments, SSE, and email blast
- * - JWT (Wix member token) or API_TOKEN auth supported
- * - Comments store {authorId, authorName}; edit/delete gated by author or admin
+ * This version (updated):
+ * - CommonJS, no ESM imports
+ * - Uses internal nanoid() (crypto-based) instead of nanoid package
+ * - CORS allowlist + referer allowlist for /price/ping
+ * - Accepts JWT (Wix member token) in addition to API_TOKEN
+ * - 🔐 decodes JWT → req.user {id,email,name,isAdmin}
+ * - 🔐 admin gating for create/update/delete ideas, price/ping, email blast, debug email
+ * - 🔐 comments:
+ *      - store stable authorId + authorName per comment
+ *      - authorName now taken from request (body/displayName or x-user-name) before falling back to req.user.name
+ *      - authorId stays tied to req.user.id (so users can only edit/delete their own)
+ *      - edit/delete still author-only OR admin
+ * - comments now return authorId + authorName to the client so the UI can show correct username
+ *   and know whether to show Edit/Delete
+ * - GET /ideas/latest and GET /ideas/:id now include authorId + authorName per comment
+ * - comment add/edit/delete endpoints return the same sanitized shape (id, authorId, authorName, text, createdAt, updatedAt)
+ * - safer string trims on req.body
  */
 
 'use strict';
@@ -49,6 +60,16 @@ const UPLOADS_PUBLIC_BASE_URL = (process.env.UPLOADS_PUBLIC_BASE_URL || '').repl
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 8);
 const ALLOWED_UPLOAD_TYPES = (process.env.ALLOWED_UPLOAD_TYPES
   || 'image/png,image/jpeg,image/webp,image/gif').split(',').map(s => s.trim());
+
+const PRICE_STALE_SEC = Number(process.env.PRICE_STALE_SEC || 900);
+
+/* allowlist for /price/ping source (TradingView etc)
+   comma-separated list like: "tradingview.com,*.tradingview.com"
+*/
+const ALLOW_FETCH_REFERERS = (process.env.ALLOW_FETCH_REFERERS || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
 
 /* ---------------------- EMAIL -------------------- */
 const SMTP_HOST   = process.env.SMTP_HOST   || '';
@@ -250,6 +271,50 @@ function sseAuthOK(req) {
   return !!decodeToken(tok);
 }
 
+/* ----------------- REFERER GUARD ------------------
+   Used ONLY for /price/ping so TradingView etc can hit it,
+   and random strangers can't spam it.
+
+   ALLOW_FETCH_REFERERS can have plain hosts ("tradingview.com")
+   or wildcard ("*.tradingview.com").
+---------------------------------------------------*/
+function wildcardToRegex(pattern) {
+  let esc = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+  esc = esc.replace(/\\\*/g, '.*');
+  return new RegExp('^' + esc + '$', 'i');
+}
+
+const ALLOWED_REF_REGEXES = ALLOW_FETCH_REFERERS.map(p => {
+  try { return wildcardToRegex(p); } catch { return null; }
+}).filter(Boolean);
+
+function getRefHost(req) {
+  const ref = String(req.headers['referer'] || req.headers['origin'] || '').trim();
+  if (!ref) return '';
+  try {
+    const u = new URL(ref);
+    return u.hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function checkReferer(req, res, next) {
+  if (!ALLOWED_REF_REGEXES.length) {
+    // nothing configured -> allow everyone
+    return next();
+  }
+  const host = getRefHost(req);
+  if (!host) {
+    return err(res, 403, 'Forbidden (no referer)');
+  }
+  const pass = ALLOWED_REF_REGEXES.some(rx => rx.test(host));
+  if (!pass) {
+    return err(res, 403, 'Forbidden referer');
+  }
+  next();
+}
+
 /* ----------------------- SSE ---------------------- */
 const clients = new Set(); // { id, res, ping }
 function sseSend(event, data) {
@@ -415,7 +480,8 @@ function normalizeIdea(input) {
       statusLight: 'gray', // gray|green|orange|red|blue
       statusNote: '',
       hitStop: false,
-      hitTargetIndex: null
+      hitTargetIndex: null,
+      notified: { stop:false, targets: {} }
     },
     authorId: String(input.authorId || ''),
     authorName: String(input.authorName || 'Member'),
@@ -474,7 +540,6 @@ function ideaPublic(it) {
 }
 
 /* -------------------- STATUS ENGINE -------------- */
-/* Note: left in place; metrics.last can be set by future features or manual processes. */
 function evalStatus(idea){
   const m = idea.metrics ||= {};
   const dir = idea.direction || 'neutral';
@@ -666,7 +731,8 @@ app.put('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 app.post('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 
 /* -------------------- COMMENTS --------------------
-   - We store both authorId and authorName on each comment.
+   IMPORTANT CHANGES:
+   - We now store both authorId and authorName on each comment.
    - authorName priority:
         req.body.displayName / req.body.name
      -> req.headers['x-user-name']
@@ -749,9 +815,6 @@ async function _commentEdit(req, res) {
   if (!it) return err(res, 404, 'Not found');
 
   const all = (it.comments?.items || []);
-  theLoop: {
-    // pass
-  }
   const c = all.find(x => String(x.id) === String(req.params.cid));
   if (!c) return err(res, 404, 'comment not found');
 
@@ -990,6 +1053,40 @@ function emailTemplatePost(item) {
   return { subject, html };
 }
 
+function emailTemplateStatus(item, kind /* 'stop' | 'target' */, info) {
+  const title   = item?.title || '';
+  const symbol  = item?.symbol || '';
+  const levels  = _bullets(item?.levelText || item?.levels || '');
+  const plan    = _bullets(item?.take || item?.content || '');
+  const imgUrl  = firstImageUrl(item);
+  const deepURL = ideaDeepLink(item);
+
+  const color   = kind==='stop' ? '#ff335a' : '#2fa8ff';
+  const badge   = kind==='stop'
+    ? '🟥 Stop Hit'
+    : `🟦 Target ${info?.label||''} Hit`;
+
+  const subj    = kind==='stop'
+    ? `🟥 STOP: ${symbol} — ${title}`
+    : `🟦 TARGET: ${symbol} — ${title}`;
+
+  const html = _emailShell({
+    preheader: subj,
+    title,
+    symbol,
+    levelsHTML: levels,
+    planHTML: plan,
+    imgUrl,
+    ctaHref: deepURL,
+    ctaText: 'Open on Dashboard',
+    badgeText: badge,
+    theme: EMAIL_THEME,
+    statusColor: color
+  });
+
+  return { subject: subj, html };
+}
+
 async function recipientsFor(reqBody){
   // 1. EMAIL_FORCE_ALL_TO overrides everything (great for testing)
   const forced = splitEmails(EMAIL_FORCE_ALL_TO);
@@ -1130,6 +1227,137 @@ app.post('/email/post', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+/* ---------------------- STATUS EMAIL TRIGGERS ----- */
+async function maybeNotify(idea, reason /* 'stop' | 'target' */, info) {
+  try{
+    const { list } = await recipientsFor({});
+    if (!list.length) return;
+    const tpl = emailTemplateStatus(idea, reason, info);
+    await sendEmailBlast({
+      subject: tpl.subject,
+      html: tpl.html,
+      toList: list
+    });
+  } catch (e){
+    console.warn('[notify]', reason, idea?.id, e?.message || e);
+  }
+}
+
+/* ---------------------- PRICE PING ----------------
+ * POST /price/ping
+ *  body: { symbol?: string, id?: string, price: number, at?: ISO }
+ *  - If id present -> update that idea
+ *  - else update ALL live ideas matching symbol
+ *  - Triggers SSE idea:status + idea:update
+ *  - Fires email once on stop/target hit
+ *
+ * We ALSO gate this route with checkReferer() so only approved
+ * referers/origins (tradingview etc.) can hit it in production.
+ *
+ * 🔐 requireAdmin: only admin/api token should be allowed to move live prices.
+ ---------------------------------------------------*/
+app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res) => {
+  const price  = nnum(req.body?.price);
+  const at     = String(req.body?.at || nowISO());
+  const symbol = String(req.body?.symbol || '').trim().toUpperCase();
+  const id     = String(req.body?.id || '').trim();
+
+  if (!Number.isFinite(price)) return err(res, 400, 'price required');
+
+  const db = await loadDB();
+  let touched = [];
+
+  const updateOne = async (it) => {
+    it.metrics ||= {};
+    it.metrics.last   = price;
+    it.metrics.lastAt = at;
+
+    evalStatus(it);
+
+    // Track first target hit
+    const dir = it.direction || 'neutral';
+    const tgs = Array.isArray(it.metrics.targets)
+      ? it.metrics.targets.map(Number)
+      : [];
+
+    if (tgs.length) {
+      if (dir === 'long') {
+        const idx = tgs.findIndex(tp => Number.isFinite(tp) && price >= tp);
+        if (idx >= 0 && (it.metrics.hitTargetIndex == null || idx < it.metrics.hitTargetIndex)) {
+          it.metrics.hitTargetIndex = idx;
+        }
+      } else if (dir === 'short') {
+        const idx = tgs.findIndex(tp => Number.isFinite(tp) && price <= tp);
+        if (idx >= 0 && (it.metrics.hitTargetIndex == null || idx < it.metrics.hitTargetIndex)) {
+          it.metrics.hitTargetIndex = idx;
+        }
+      }
+    }
+
+    // Notify once
+    it.metrics.notified ||= { stop:false, targets:{} };
+
+    if (it.metrics.statusLight === 'red' && !it.metrics.notified.stop) {
+      it.metrics.notified.stop = true;
+      await maybeNotify(it, 'stop');
+    } else if (
+      Number.isFinite(it.metrics.hitTargetIndex) &&
+      !it.metrics.notified.targets[it.metrics.hitTargetIndex]
+    ) {
+      it.metrics.notified.targets[it.metrics.hitTargetIndex] = true;
+      await maybeNotify(it, 'target', {
+        index: it.metrics.hitTargetIndex,
+        label: `T${it.metrics.hitTargetIndex+1}`
+      });
+    }
+
+    it.updatedAt = nowISO();
+    touched.push(ideaPublic(it));
+
+    // Push SSE quick status
+    sseSend('idea:status', {
+      id: it.id,
+      metrics: {
+        last: it.metrics.last,
+        lastAt: it.metrics.lastAt,
+        statusLight: it.metrics.statusLight,
+        statusNote: it.metrics.statusNote,
+        hitStop: !!it.metrics.hitStop,
+        hitTargetIndex: it.metrics.hitTargetIndex ?? null
+      }
+    });
+
+    // And full update for listeners that only use idea:update
+    sseSend('idea:update', ideaPublic(it));
+  };
+
+  if (id) {
+    const it = db.ideas.find(x => String(x.id) === id);
+    if (it) await updateOne(it);
+  } else if (symbol) {
+    const list = db.ideas.filter(x =>
+      String(x.symbol || '').toUpperCase() === symbol &&
+      x.status !== 'archived'
+    );
+    for (const it of list) {
+      await updateOne(it);
+    }
+  } else {
+    return err(res, 400, 'provide id or symbol');
+  }
+
+  if (touched.length) {
+    await saveDB(db);
+    return ok(res, {
+      ok:true,
+      updated: touched.length,
+      items: touched
+    });
+  }
+
+  return ok(res, { ok:true, updated: 0, items: [] });
+});
+
 /* ----------------------- SUBSCRIBERS -------------- */
 async function subscribeCore(email, name) {
   const s = await loadSubs();
@@ -1246,7 +1474,7 @@ async function start() {
   buildMulter();
   app.listen(PORT, () => {
     console.log(`[tcpp-ideas-backend] listening on :${PORT} env=${NODE_ENV} data=${DATA_FILE}`);
-    console.log(`SSE: /events  CRUD: /ideas  Latest: /ideas/latest  Upload: /upload`);
+    console.log(`SSE: /events  CRUD: /ideas  Latest: /ideas/latest  Upload: /upload  Price: /price/ping`);
     console.log(`Email: /email/post  Debug: /debug/email/status, /debug/email/test`);
   });
 }
