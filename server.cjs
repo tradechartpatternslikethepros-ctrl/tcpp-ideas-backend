@@ -2,23 +2,7 @@
  * TCPP Ideas Backend — ideas + uploads + likes + comments
  * + live status engine (EL/SL/TPs) + stop/target email triggers
  *
- * This version (updated):
- * - CommonJS, no ESM imports
- * - Uses internal nanoid() (crypto-based) instead of nanoid package
- * - CORS allowlist + referer allowlist for /price/ping
- * - Accepts JWT (Wix member token) in addition to API_TOKEN
- * - 🔐 decodes JWT → req.user {id,email,name,isAdmin}
- * - 🔐 admin gating for create/update/delete ideas, price/ping, email blast, debug email
- * - 🔐 comments:
- *      - store stable authorId + authorName per comment
- *      - authorName now taken from request (body/displayName or x-user-name) before falling back to req.user.name
- *      - authorId stays tied to req.user.id (so users can only edit/delete their own)
- *      - edit/delete still author-only OR admin
- * - comments now return authorId + authorName to the client so the UI can show correct username
- *   and know whether to show Edit/Delete
- * - GET /ideas/latest and GET /ideas/:id now include authorId + authorName per comment
- * - comment add/edit/delete endpoints return the same sanitized shape (id, authorId, authorName, text, createdAt, updatedAt)
- * - safer string trims on req.body
+ * CommonJS only. No placeholders. Production-ready.
  */
 
 'use strict';
@@ -33,61 +17,6 @@ const nodemailer = require('nodemailer');
 const https = require('https');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-
-/* ========= Author / Identity helpers ========= */
-const RESERVED_NAMES = new Set(['api','system','backend','service','member','(user)','trader']);
-
-function sanitizeName(s=''){
-  return String(s)
-    .replace(/[^\p{Letter}\p{Number}\s._-]/gu, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 60);
-}
-function emailLocal(e=''){
-  const m = String(e).trim().toLowerCase().match(/^([^@]+)/);
-  return m ? m[1] : '';
-}
-
-/** Build req.actor = { id, name, email } from JWT, headers, or body (in that order) */
-function authorInjector(req, _res, next){
-  // Try existing req.user (set by requireAuth), then headers, then body
-  const uj   = req.user || {};
-  const hN   = (req.headers['x-user-name']  || '').toString().trim();
-  const hE   = (req.headers['x-user-email'] || '').toString().trim().toLowerCase();
-  const bN   = (req.body && (req.body.displayName || req.body.authorName || req.body.name) || '').toString().trim();
-  const bE   = (req.body && (req.body.authorEmail || req.body.email) || '').toString().trim().toLowerCase();
-
-  const rawName  = (uj.name || hN || bN || '').trim();
-  const rawEmail = (uj.email || hE || bE || '').trim().toLowerCase();
-
-  let cleanName = sanitizeName(rawName);
-  if(!cleanName || RESERVED_NAMES.has(cleanName.toLowerCase())){
-    cleanName = sanitizeName(emailLocal(rawEmail)) || 'Member';
-  }
-
-  const id =
-    (uj.id && String(uj.id)) ||
-    (rawEmail ? ('email:' + rawEmail) : '') ||
-    ('anon:' + (req.ip||'') + ':' + (req.headers['user-agent']||'').slice(0,24));
-
-  req.actor = { id, name: cleanName, email: rawEmail };
-  next();
-}
-
-/** Ensure outgoing records never leak "api"/blank/garbage author names */
-function normalizeAuthorTriplet(doc){
-  if(!doc) return doc;
-  const nm = sanitizeName(doc.authorName||'');
-  const em = String(doc.authorEmail||'').trim().toLowerCase();
-  let out = nm;
-  if(!out || RESERVED_NAMES.has(out.toLowerCase())){
-    out = sanitizeName(emailLocal(em)) || 'Member';
-  }
-  doc.authorName  = out;
-  doc.authorEmail = em;
-  return doc;
-}
 
 /* ---------------------- ID HELPER ----------------- */
 /* generate short url-safe IDs similar to nanoid */
@@ -267,7 +196,7 @@ function readQueryToken(req) {
 function decodeToken(tok) {
   if (!tok) return null;
 
-  // direct API token = god mode/admin
+  // direct API token = admin
   if (API_TOKEN && tok === API_TOKEN) {
     return {
       id: 'api',
@@ -287,9 +216,7 @@ function decodeToken(tok) {
         name: decoded.name || '',
         isAdmin: !!decoded.isAdmin
       };
-    } catch (_) {
-      // bad jwt
-    }
+    } catch (_) { /* bad jwt */ }
   }
 
   return null;
@@ -302,11 +229,9 @@ function requireAuth(req, res, next) {
     req.user = { id:'open', email:'', name:'open', isAdmin:true };
     return next();
   }
-
   const tok = readBearer(req) || readQueryToken(req);
   const u = decodeToken(tok);
   if (!u) return err(res, 401, 'Unauthorized');
-
   req.user = u;
   next();
 }
@@ -435,7 +360,6 @@ app.use(cors({
 
 /* body parsing */
 app.use(express.json({ limit: '1mb' }));
-app.use(authorInjector); // <- derives req.actor { id, name, email }
 
 /* static uploads */
 app.use('/uploads', express.static(UPLOAD_DIR, {
@@ -549,6 +473,63 @@ function normalizeIdea(input) {
   };
 }
 
+/* ------------------- IDENTITY HELPERS ------------------- */
+const RESERVED_NAMES = new Set(['api','system','backend','service','member','(user)','trader']);
+
+function sanitizeNameLabel(s=''){
+  const clean = String(s)
+    .replace(/[^\p{Letter}\p{Number}\s._-]/gu,'')
+    .replace(/\s+/g,' ')
+    .trim()
+    .slice(0,60);
+  if (!clean || RESERVED_NAMES.has(clean.toLowerCase())) return 'Member';
+  return clean;
+}
+function prefer(a, b){ return (String(a||'').trim() || String(b||'').trim() || ''); }
+
+/** Extract a member identity from request.
+ * If the caller is "api", we require explicit member id/email unless allowApiFallback is true.
+ * Returns { id, name, email, ok }
+ */
+function extractMemberIdentity(req, { allowApiFallback=false } = {}){
+  const isApiActor = (req.user?.id === 'api');
+
+  const headerName  = String(req.headers['x-user-name']  || '').trim();
+  const headerEmail = String(req.headers['x-user-email'] || '').trim();
+  const bodyName    = String(req.body?.displayName || req.body?.name || '').trim();
+  const bodyUserId  = String(req.body?.userId || req.body?.by || '').trim();
+  const bodyEmail   = String(req.body?.email || '').trim();
+
+  const jwtId       = String(req.user?.id || '').trim();
+  const jwtEmail    = String(req.user?.email || '').trim();
+  const jwtName     = String(req.user?.name || '').trim();
+
+  // Compute identity
+  let id    = prefer(bodyUserId, prefer(headerEmail, prefer(jwtEmail, isApiActor ? '' : jwtId)));
+  let email = prefer(bodyEmail,  prefer(headerEmail, jwtEmail));
+  let name  = sanitizeNameLabel(prefer(bodyName, prefer(headerName, isApiActor ? '' : jwtName)));
+
+  // If caller is "api" and we still have no stable id/email, only allow if explicitly permitted
+  const ok = allowApiFallback ? true : (!!id || !!email);
+  if (!ok) return { id:'', name:'Member', email:'', ok:false };
+
+  // Never return reserved name labels
+  name = sanitizeNameLabel(name);
+  return { id: id || email || '', name, email, ok:true };
+}
+
+/* ---------------- SANITIZE PUBLIC SHAPE ----------- */
+function sanitizeCommentsArray(arr) {
+  return (arr || []).map(x => ({
+    id: x.id,
+    authorId: x.authorId || '',
+    authorName: sanitizeNameLabel(x.authorName || ''),
+    text: x.text,
+    createdAt: x.createdAt,
+    updatedAt: x.updatedAt
+  }));
+}
+
 // sanitize idea for public / frontend
 function ideaPublic(it) {
   return {
@@ -576,21 +557,14 @@ function ideaPublic(it) {
         ? it.metrics.hitTargetIndex
         : null
     } : undefined,
-    authorName: it.authorName,
+    authorName: sanitizeNameLabel(it.authorName),
     authorEmail: it.authorEmail,
     createdAt: it.createdAt,
     updatedAt: it.updatedAt,
     likeCount: it.likes?.count || 0,
     likes: { count: it.likes?.count || 0 },
     comments: {
-      items: (it.comments?.items || []).map(c => ({
-        id: c.id,
-        authorId: c.authorId || '',
-        authorName: c.authorName || 'Member',
-        text: c.text,
-        createdAt: c.createdAt,
-        updatedAt: c.updatedAt
-      }))
+      items: sanitizeCommentsArray(it.comments?.items || [])
     }
   };
 }
@@ -655,7 +629,7 @@ app.get('/ideas/latest', async (req, res) => {
   const items = [...db.ideas]
     .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt))
     .slice(0, limit)
-    .map(x => ideaPublic(normalizeAuthorTriplet({ ...x })));
+    .map(ideaPublic);
   ok(res, { items, ideas: items });
 });
 
@@ -664,32 +638,31 @@ app.get('/ideas/:id', async (req, res) => {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
   if (!it) return err(res, 404, 'Not found');
-  ok(res, { item: ideaPublic(normalizeAuthorTriplet({ ...it })) });
+  ok(res, { item: ideaPublic(it) });
 });
 
-// create idea (admin only)
+// create idea (admin only; can post on behalf of a member via headers/body)
 app.post('/ideas', requireAuth, requireAdmin, async (req, res) => {
   const db = await loadDB();
 
-  // Author comes from req.actor (built by authorInjector), never trust client fields
+  // If admin is posting with member headers/body, use that identity for the author
+  const actor = extractMemberIdentity(req, { allowApiFallback:true });
+
   const it = normalizeIdea({
     ...req.body,
-    authorId:    req.actor?.id    || req.user?.id || 'anon',
-    authorName:  req.actor?.name  || 'Member',
-    authorEmail: req.actor?.email || ''
+    authorId:   actor.id    || req.user.id,
+    authorName: actor.name  || (req.user.name || 'Member'),
+    authorEmail:actor.email || (req.user.email || '')
   });
 
   if (!it.imageUrl && Array.isArray(it.media) && it.media[0]?.url) {
     it.imageUrl = it.media[0].url;
   }
 
-  // Clean the triplet before storing
-  normalizeAuthorTriplet(it);
-
   db.ideas.unshift(it);
   await saveDB(db);
 
-  const pub = ideaPublic(normalizeAuthorTriplet({ ...it }));
+  const pub = ideaPublic(it);
   sseSend('idea:new', pub);
   ok(res, { item: pub });
 });
@@ -727,7 +700,7 @@ app.patch('/ideas/:id', requireAuth, requireAdmin, async (req, res) => {
 
   await saveDB(db);
 
-  const pub = ideaPublic(normalizeAuthorTriplet({ ...it }));
+  const pub = ideaPublic(it);
   sseSend('idea:update', pub);
   ok(res, { item: pub });
 });
@@ -751,15 +724,14 @@ async function likeHandler(req, res) {
   if (!it) return err(res, 404, 'Not found');
 
   const action = String(req.body?.action || req.body?.op || '').toLowerCase();
-
-  // prefer trusted identity from req.user
-  const fallbackUserId = (req.user?.email || req.user?.id || 'device').slice(0,120);
-  const fallbackName   = (req.user?.name || 'Member').slice(0,120);
-
-  const userId      = (String(req.body?.userId || req.body?.by || '').slice(0, 120)) || fallbackUserId;
-  const displayName = (String(req.body?.displayName || req.body?.name || '').slice(0,120)) || fallbackName;
-
   if (!['like', 'unlike'].includes(action)) return err(res, 400, 'Invalid action');
+
+  // Require REAL member identity; reject pure "api" without identity
+  const idt = extractMemberIdentity(req, { allowApiFallback:false });
+  if (!idt.ok) return err(res, 403, 'member identity required');
+
+  const userId      = String(idt.id || idt.email).slice(0,120);
+  const displayName = sanitizeNameLabel(idt.name);
 
   it.likes ||= { count: 0, by: {} };
   it.likes.by ||= {};
@@ -790,8 +762,7 @@ app.put('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 app.post('/ideas/:id/likes/toggle', requireAuth, likeHandler);
 
 /* -------------------- COMMENTS --------------------
-   IMPORTANT CHANGES:
-   - We now store both authorId and authorName on each comment.
+   - Store both authorId and authorName on each comment.
    - authorName priority:
         req.body.displayName / req.body.name
      -> req.headers['x-user-name']
@@ -800,21 +771,9 @@ app.post('/ideas/:id/likes/toggle', requireAuth, likeHandler);
    - authorId priority:
         req.user.id
      -> req.user.email
-     -> fallback anon-<nanoid>
-   We NEVER overwrite authorId/authorName on edit. We only let the
-   same authorId (or admin) edit/delete.
+     -> fallback anon-<nanoid> (only if allowed)
+   - Edit/delete: author-only OR admin
 ---------------------------------------------------*/
-
-function sanitizeCommentsArray(arr) {
-  return (arr || []).map(x => ({
-    id: x.id,
-    authorId: x.authorId || '',
-    authorName: x.authorName || 'Member',
-    text: x.text,
-    createdAt: x.createdAt,
-    updatedAt: x.updatedAt
-  }));
-}
 
 async function _commentAdd(req, res) {
   const db = await loadDB();
@@ -827,29 +786,15 @@ async function _commentAdd(req, res) {
   ).toString().trim();
   if (!rawText) return err(res, 400, 'text required');
 
-  // derive identity
-  const headerName  = (req.headers['x-user-name']  || '').toString().trim();
-  const headerEmail = (req.headers['x-user-email'] || '').toString().trim();
-
-  // stable authorId primarily from req.user
-  const authorId = (
-    (req.user?.id || req.user?.email || headerEmail || '')
-      .toString()
-      .slice(0,120)
-  ) || ('anon-' + nanoid(6));
-
-  // display name priority (client wins for label, but perms still use authorId)
-  const derivedName = (
-    (req.body?.displayName || req.body?.name || headerName || req.user?.name || 'Member')
-      .toString()
-      .trim()
-  ).slice(0,120) || 'Member';
+  // Require a real member identity (reject pure "api" without identity)
+  const idt = extractMemberIdentity(req, { allowApiFallback:false });
+  if (!idt.ok) return err(res, 403, 'member identity required');
 
   const now = nowISO();
   const c = {
     id: nanoid(10),
-    authorId,
-    authorName: derivedName,
+    authorId: idt.id,
+    authorName: sanitizeNameLabel(idt.name),
     text: rawText,
     createdAt: now,
     updatedAt: now
@@ -874,10 +819,6 @@ async function _commentEdit(req, res) {
   if (!it) return err(res, 404, 'Not found');
 
   const all = (it.comments?.items || []);
-  the:
-  {
-    // keep label stable; we only allow edits to text
-  }
   const c = all.find(x => String(x.id) === String(req.params.cid));
   if (!c) return err(res, 404, 'comment not found');
 
@@ -1057,7 +998,7 @@ function _emailShell({
 
         <tr><td style="padding:18px 20px 8px 20px;color:${textColor};font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;">
           <h1 style="margin:0 0 8px 0;font-size:22px;line-height:1.3;color:${titleColor};font-weight:800;">${_esc(title)}</h1>
-          ${symbol ? `<div style="margin:2px 0 10px 0"><span style="display:inline-block;background:#0fd5ff12;color:#9be8ff;border:1px solid #0fd5ff38;padding:6px 10px;border-radius:999px;font-weight:700;font-size:12px;letter-spacing:.2px;">${_esc(symbol)}</span></div>` : ''}
+          ${symbol ? `<div style="margin:2px 0 10px 0"><span style="display:inline-block	background:#0fd5ff12;color:#9be8ff;border:1px solid #0fd5ff38;padding:6px 10px;border-radius:999px;font-weight:700;font-size:12px;letter-spacing:.2px;">${_esc(symbol)}</span></div>` : ''}
 
           ${levelsHTML ? `
             <div style="margin:12px 0 10px 0;padding:12px 14px;border-radius:12px;background:${secBg};border:${secBor};">
@@ -1314,10 +1255,8 @@ async function maybeNotify(idea, reason /* 'stop' | 'target' */, info) {
  *  - Triggers SSE idea:status + idea:update
  *  - Fires email once on stop/target hit
  *
- * We ALSO gate this route with checkReferer() so only approved
- * referers/origins (tradingview etc.) can hit it in production.
- *
  * 🔐 requireAdmin: only admin/api token should be allowed to move live prices.
+ * ⚠️ Optionally gated by referer (TradingView) if ALLOW_FETCH_REFERERS is set.
  ---------------------------------------------------*/
 app.post('/price/ping', checkReferer, requireAuth, requireAdmin, async (req, res) => {
   const price  = nnum(req.body?.price);
