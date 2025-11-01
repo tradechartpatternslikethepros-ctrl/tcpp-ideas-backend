@@ -244,21 +244,29 @@ function readBearer(req) {
 function readQueryToken(req) {
   return (req.query && String(req.query.token || '').trim()) || '';
 }
+
+/* FIXED: honors admin flag via `admin` | `isAdmin` | `roles:['admin']` and accepts `sub` as id */
 function decodeToken(tok) {
   if (!tok) return null;
+
+  // allow raw API token
   if (API_TOKEN && tok === API_TOKEN) {
     return { id: 'api', email: '', name: 'api', isAdmin: true };
   }
+
   if (JWT_SECRET) {
     try {
-      const decoded = jwt.verify(tok, JWT_SECRET) || {};
+      const d = jwt.verify(tok, JWT_SECRET) || {};
+      const roles = Array.isArray(d.roles) ? d.roles.map(String) : [];
+      const admin = d.isAdmin === true || d.admin === true || roles.includes('admin');
+
       return {
-        id: decoded.id || '',
-        email: decoded.email || '',
-        name: decoded.name || '',
-        isAdmin: !!decoded.isAdmin
+        id: d.sub || d.id || '',
+        email: d.email || '',
+        name: d.name || '',
+        isAdmin: !!admin
       };
-    } catch (_) {}
+    } catch (_e) {}
   }
   return null;
 }
@@ -659,7 +667,7 @@ function sanitizeCommentsArray(arr) {
   }));
 }
 
-// ⬇️ FIXED: prefers body/displayName -> x-user-name -> req.actor.name -> req.user.name
+// Add
 async function _commentAdd(req, res) {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
@@ -701,6 +709,7 @@ async function _commentAdd(req, res) {
   ok(res, { items });
 }
 
+// Edit
 async function _commentEdit(req, res) {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
@@ -728,6 +737,7 @@ async function _commentEdit(req, res) {
   ok(res, { items });
 }
 
+// Delete
 async function _commentDelete(req, res) {
   const db = await loadDB();
   const it = db.ideas.find(x => String(x.id) === String(req.params.id));
@@ -785,11 +795,6 @@ function splitEmails(list) {
     .filter(Boolean)
     .filter(e => EMAIL_RX_LOCAL.test(e));
 }
-function packToBcc(all) {
-  const uniqd = uniq(all);
-  if (uniqd.length <= 1) return { to: uniqd[0] || undefined, bcc: undefined };
-  return { to: uniqd[0], bcc: uniqd.slice(1) };
-}
 function _esc(s) {
   return String(s || '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -804,6 +809,12 @@ function _bullets(s) {
   return `<ul style="margin:8px 0 0 20px;padding:0">
     ${parts.map(li => `<li style="margin:6px 0;line-height:1.45">${_esc(li)}</li>`).join('')}
   </ul>`;
+}
+function undisclosedToHeader() {
+  const from = fromHeader();
+  const m = from.match(/<([^>]+)>/);
+  const addr = m ? m[1] : (MAIL_FROM || SMTP_USER || 'no-reply@example.com');
+  return `Undisclosed recipients <${addr}>`;
 }
 function _emailShell({
   preheader, title, symbol, levelsHTML, planHTML, imgUrl, ctaHref, ctaText, badgeText, theme, statusColor
@@ -864,7 +875,7 @@ function _emailShell({
           ${symbol ? `<div style="margin:2px 0 10px 0"><span style="display:inline-block;background:#0fd5ff12;color:#9be8ff;border:1px solid #0fd5ff38;padding:6px 10px;border-radius:999px;font-weight:700;font-size:12px;letter-spacing:.2px;">${_esc(symbol)}</span></div>` : ''}
 
           ${levelsHTML ? `
-            <div style="margin:12px 0 10px 0;padding:12px 14px;border-radius:12px;background:${secBg};border:${secBor};">
+            <div style="margin:12px 0 10px 0;padding:12px 14px;border-radius:12px;background:${isClear ? 'rgba(0,0,0,0.03)' : 'rgba(255,255,255,0.03)'};border:${isClear ? '1px dashed rgba(0,0,0,0.08)' : '1px dashed rgba(255,255,255,0.08)'};">
               <div style="font-size:12px;color:${isClear ? '#5a6a8a' : '#99a6c7'};letter-spacing:.3px;text-transform:uppercase;font-weight:700;margin-bottom:6px">Levels</div>
               ${levelsHTML}
             </div>` : ''}
@@ -880,11 +891,11 @@ function _emailShell({
           <table role="presentation" cellpadding="0" cellspacing="0"><tr>
             <td><a href="${_esc(ctaHref)}" style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;text-decoration:none;border-radius:999px;font-weight:900;font-size:14px" target="_blank" rel="noopener">${_esc(ctaText || 'Open on Dashboard')}</a></td>
             <td width="12"></td>
-            <td><a href="${_esc(SITE_URL)}" style="display:inline-block;padding:12px 16px;background:transparent;color:${visitColor};text-decoration:none;border-radius:999px;font-weight:700;font-size:14px;border:${visitBor}" target="_blank" rel="noopener">Visit Site</a></td>
+            <td><a href="${_esc(SITE_URL)}" style="display:inline-block;padding:12px 16px;background:transparent;color:${isClear ? '#164a76' : '#cfe8ff'};text-decoration:none;border-radius:999px;font-weight:700;font-size:14px;border:${isClear ? '1px solid rgba(0,0,0,0.12)' : '1px solid rgba(255,255,255,0.14)'}" target="_blank" rel="noopener">Visit Site</a></td>
           </tr></table>
         </td></tr>
 
-        <tr><td style="padding:14px 20px 20px 20px;color:${footerTxt};font-size:12px;border-top:${footerBor};">
+        <tr><td style="padding:14px 20px 20px 20px;color:${isClear ? '#3a4358' : '#8fa0c6'};font-size:12px;border-top:${isClear ? '1px solid rgba(0,0,0,0.06)' : '1px solid rgba(255,255,255,0.06)'};">
           <div>You’re receiving this update from ${_esc(brand)}.</div>
         </td></tr>
       </table>
@@ -950,19 +961,20 @@ async function recipientsFor(reqBody){
   return admins.length ? { list: admins, mode:'admin' } : { list: [], mode:'none' };
 }
 function getMailer(){ if (!smtpReady()) return null; return getTransporter(); }
+
+/* FIXED: send with To = "Undisclosed recipients <sender>" and ALL recipients in BCC */
 async function sendEmailBlast({ subject, html, toList }){
   try{
     const tx = getMailer();
     if (tx && toList.length){
-      const from    = fromHeader();
-      const replyTo = EMAIL_REPLY_TO || undefined;
-      const adminBcc = EMAIL_BCC_ADMIN;
-      const { to, bcc } = packToBcc(toList);
-      const finalBcc = uniq([...(bcc || []), ...adminBcc]);
+      const from     = fromHeader();
+      const replyTo  = EMAIL_REPLY_TO || undefined;
+      const toVis    = undisclosedToHeader();
+      const finalBcc = uniq([...toList, ...EMAIL_BCC_ADMIN]);
 
       const info = await tx.sendMail({
         from,
-        to: to || undefined,
+        to: toVis,                          // visible only, not a real recipient
         bcc: finalBcc.length ? finalBcc : undefined,
         subject, html, replyTo
       });
@@ -972,13 +984,16 @@ async function sendEmailBlast({ subject, html, toList }){
     console.warn('[email][smtp] failed, trying HTTP fallback:', e?.message || e);
   }
 
+  // Mailjet HTTP fallback (also BCC-only)
   if (!(SMTP_USER && SMTP_PASS)) throw new Error('No SMTP creds for HTTP fallback');
   if (!toList.length) return { sent:0, via:'http' };
 
+  const senderEmail = (MAIL_FROM || SMTP_USER);
   const payload = {
     Messages: [{
-      From: { Email: (MAIL_FROM || SMTP_USER), Name: MAIL_FROM_NAME || 'Notifier' },
-      To: toList.map(e => ({ Email: e })),
+      From: { Email: senderEmail, Name: MAIL_FROM_NAME || 'Notifier' },
+      To:   [{ Email: senderEmail, Name: 'Undisclosed recipients' }], // visible To
+      Bcc:  uniq([...toList, ...EMAIL_BCC_ADMIN]).map(e => ({ Email: e })), // all real recipients here
       Subject: subject,
       HTMLPart: html,
       Headers: EMAIL_REPLY_TO ? { 'Reply-To': EMAIL_REPLY_TO } : undefined
