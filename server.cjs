@@ -788,13 +788,19 @@ function fromHeader() {
   return `"${MAIL_FROM_NAME}" <no-reply@localhost>`;
 }
 const EMAIL_RX_LOCAL = EMAIL_RX;
+
+/* HARDENED: strip quotes/angles/commas before validation */
 function splitEmails(list) {
   return String(list || '')
+    .replace(/["'<>]/g, '')
     .split(/[,\s;]+/)
     .map(s => s.trim().toLowerCase())
     .filter(Boolean)
     .filter(e => EMAIL_RX_LOCAL.test(e));
 }
+
+const uniqJoin = list => Array.from(new Set(list)).join(', ');
+
 function _esc(s) {
   return String(s || '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -889,7 +895,7 @@ function _emailShell({
 
         <tr><td align="left" style="padding:8px 20px 24px 20px">
           <table role="presentation" cellpadding="0" cellspacing="0"><tr>
-            <td><a href="${_esc(ctaHref)}" style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;text-decoration:none;border-radius:999px;font-weight:900;font-size:14px" target="_blank" rel="noopener">${_esc(ctaText || 'Open on Dashboard')}</a></td>
+            <td><a href="${_esc(ideaDeepLink({title, symbol}))}" style="display:inline-block;padding:12px 18px;background:#00d0ff;color:#001018;text-decoration:none;border-radius:999px;font-weight:900;font-size:14px" target="_blank" rel="noopener">${_esc(ctaText || 'Open on Dashboard')}</a></td>
             <td width="12"></td>
             <td><a href="${_esc(SITE_URL)}" style="display:inline-block;padding:12px 16px;background:transparent;color:${isClear ? '#164a76' : '#cfe8ff'};text-decoration:none;border-radius:999px;font-weight:700;font-size:14px;border:${isClear ? '1px solid rgba(0,0,0,0.12)' : '1px solid rgba(255,255,255,0.14)'}" target="_blank" rel="noopener">Visit Site</a></td>
           </tr></table>
@@ -974,7 +980,7 @@ async function sendEmailBlast({ subject, html, toList }){
 
       const info = await tx.sendMail({
         from,
-        to: toVis,                          // visible only, not a real recipient
+        to: toVis,
         bcc: finalBcc.length ? finalBcc : undefined,
         subject, html, replyTo
       });
@@ -1149,6 +1155,29 @@ app.post('/subscribe', requireAuth, async (req, res) => {
   ok(res, out);
 });
 
+/* -------- NEW: Subscribers management (list + CSV) -------- */
+app.get('/subscribers', requireAuth, requireAdmin, async (_req, res) => {
+  const s = await loadSubs();
+  ok(res, { items: (s.subs || []).map(x => ({
+    email: x.email, name: x.name, createdAt: x.createdAt, status: x.status || 'active'
+  }))});
+});
+app.get('/subscribers.csv', requireAuth, requireAdmin, async (_req, res) => {
+  const s = await loadSubs();
+  const rows = [['email','name','createdAt','status']]
+    .concat((s.subs || []).map(x => [
+      (x.email || '').replace(/"/g,'""'),
+      (x.name || '').replace(/"/g,'""'),
+      x.createdAt || '',
+      x.status || 'active'
+    ]))
+    .map(cols => cols.map(c => `"${c}"`).join(','))
+    .join('\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="subscribers.csv"');
+  res.send(rows + '\n');
+});
+
 /* ----------------------- UPLOAD ------------------- */
 app.post('/upload', requireAuth, requireAdmin, (req, res) => {
   if (!upload) return err(res, 500, 'Upload not initialized');
@@ -1162,6 +1191,7 @@ app.post('/upload', requireAuth, requireAdmin, (req, res) => {
 
 /* ----------------------- DEBUG -------------------- */
 app.get('/debug/email/status', requireAuth, requireAdmin, (_req, res) => {
+  const sanitizedForceList = splitEmails(EMAIL_FORCE_ALL_TO);
   ok(res, {
     smtp: {
       ready: !!(SMTP_HOST && SMTP_PORT && (SMTP_USER ? SMTP_PASS : true)),
@@ -1170,7 +1200,8 @@ app.get('/debug/email/status', requireAuth, requireAdmin, (_req, res) => {
     },
     branding: {
       siteUrl: SITE_URL, logo: LOGO_URL, from: fromHeader(),
-      bccAdmins: EMAIL_BCC_ADMIN, forceTo: EMAIL_FORCE_ALL_TO || null,
+      bccAdmins: splitEmails(EMAIL_BCC_ADMIN.join(',')),
+      forceTo: sanitizedForceList.length ? uniqJoin(sanitizedForceList) : null,
       uploadsPublicBaseUrl: UPLOADS_PUBLIC_BASE_URL || null,
       assetBaseUrl: ASSET_BASE_URL, emailTheme: EMAIL_THEME
     }
@@ -1216,7 +1247,7 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`[tcpp-ideas-backend] listening on :${PORT} env=${NODE_ENV} data=${DATA_FILE}`);
     console.log(`SSE: /events  CRUD: /ideas  Latest: /ideas/latest  Upload: /upload  Price: /price/ping`);
-    console.log(`Email: /email/post  Debug: /debug/email/status, /debug/email/test`);
+    console.log(`Email: /email/post  Debug: /debug/email/status, /debug/email/test  Subs: /subscribers(.csv)`);
   });
 }
 start();
